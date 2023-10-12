@@ -1,5 +1,8 @@
 import os
 
+# if global_zero35_manager is None:
+global_zero35_manager = None
+
 from deepspeed.accelerator import get_accelerator
 from deepspeed import comm as dist
 from deepspeed.utils import logger
@@ -7,19 +10,32 @@ from deepspeed.runtime.swap_tensor.partitioned_param_swapper import PartitionedP
 
 import torch
 
-global_zero35_manager = None
 
+def get_global_zero35_manager(enable_zero35=False, mpu=None):
+    global global_zero35_manager
+    if global_zero35_manager is None:
+        print("init GlobalZero35GroupManager!!", flush=True)
+        global_zero35_manager = GlobalZero35GroupManager(enable_zero35=enable_zero35, mpu=mpu)
+    else:
+        return global_zero35_manager
 
-def zero35_debug(msg, rank=None, force=True):
+FORCE = False
+def zero35_debug(msg, rank=None, force=FORCE, flush=True):
     if force:
         msg = f"Rank: {os.environ['SLURM_PROCID']}, " + msg
         if rank is None:
-            logger.info(msg)
+            if flush:
+                print(msg, flush=True)
+            else:
+                logger.info(msg)
         elif os.environ['SLURM_PROCID'] == str(rank):
-            logger.info(msg)
+            if flush:
+                print(msg, flush=True)
+            else:
+                logger.info(msg)
 
 
-def zero35_g_p_reduce_scatter_coalesced(tensor_list, dp_comm_group, param_comm_group, partition_type):
+def zero35_g_p_reduce_scatter_coalesced(tensor_list, partition_type):
     # reshape 的逻辑
     # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, 4, 1, 5, 2, 6, 3, 7]
     # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, 4, 1, 5, 2, 6, 3, 7]
@@ -28,6 +44,10 @@ def zero35_g_p_reduce_scatter_coalesced(tensor_list, dp_comm_group, param_comm_g
 
     do_reshape = partition_type == "grad" or partition_type == "param"
     dtype = tensor_list[0].dtype
+
+    # if do_reshape:
+    dp_comm_group = global_zero35_manager._dp_process_group
+    param_comm_group = global_zero35_manager._param_process_group
 
     if do_reshape:
         scatter_comm_group = param_comm_group
@@ -72,7 +92,7 @@ def zero35_g_p_reduce_scatter_coalesced(tensor_list, dp_comm_group, param_comm_g
 
     return tensor_list, scatter_comm_group
 
-def zero35_g_p_all_gather_coalesced(tensor_list, dp_comm_group, param_comm_group, partition_type=None):
+def zero35_g_p_all_gather_coalesced(tensor_list, partition_type=None):
     pass
     # reshape 的逻辑
     # [0, 4, 1, 5, 2, 6, 3, 7]  -> [0, 1, 2, 3, 4, 5, 6, 7]  
@@ -85,6 +105,9 @@ def zero35_g_p_all_gather_coalesced(tensor_list, dp_comm_group, param_comm_group
     dtype = tensor_list[0].dtype
 
     # if do_reshape:
+    dp_comm_group = global_zero35_manager._dp_process_group
+    param_comm_group = global_zero35_manager._param_process_group
+
     all_gather_comm_group = param_comm_group
 
     dp_world_size = dist.get_world_size(dp_comm_group)
@@ -131,23 +154,26 @@ def zero35_g_p_all_gather_coalesced(tensor_list, dp_comm_group, param_comm_group
 
 class GlobalZero35GroupManager:
     def __init__(self, enable_zero35, mpu=None) -> None:
+        print(f"enable_zero35: {enable_zero35} !!!", flush=True)
         # TODO, zero35 不能和tp或pp一起使用
         self.enable_zero35 = enable_zero35
         self._dp_process_group = dist.get_world_group()
+        self._os_rank = dist.get_rank()
+
         self.world_size = dist.get_world_size(self._dp_process_group)
 
         if mpu is not None:
             self.model_parallel_group = mpu.get_model_parallel_group()
             self.model_parallel_rank = mpu.get_model_parallel_rank()
-            self.mode_parallel_size = dist.get_world_size(self.model_parallel_group)
-            self.data_parallel_size = self.world_size // self.mode_parallel_size
+            self.model_parallel_size = dist.get_world_size(self.model_parallel_group)
+            self.data_parallel_size = self.world_size // self.model_parallel_size
         else:
-            self.mode_parallel_size = 1
+            self.model_parallel_size = 1
             self.model_parallel_group = None
             self.model_parallel_rank = 0
-            self.data_parallel_size = 1
+            self.data_parallel_size = self.world_size
 
-        assert self.mode_parallel_size == 1, "zero35现在不支持模型并行"
+        assert self.model_parallel_size == 1, "zero35现在不支持模型并行"
 
         self.zero35_parallel_size = 8 # TODO: 将这个变成可配置参数
         self.rank_num_per_dp_group = self.world_size // self.data_parallel_size
@@ -172,6 +198,10 @@ class GlobalZero35GroupManager:
             self._param_world_size = 1
             self._grad_rank = 0
             self._grad_world_size = 1
+
+        zero35_debug(f"zero35_parallel_size: {self.zero35_parallel_size}, \
+num_zero35_parallel_group:{self.num_zero35_parallel_group}, \
+ranks:{dist.get_all_ranks_from_group(self.zero35_group)}")
 
 
     def get_partition_dp_group(self, param, partition_type):
@@ -225,29 +255,31 @@ class GlobalZero35GroupManager:
     def get_world_size(self, partition_type):
         return dist.get_world_size(self.get_dp_process_group(partition_type))
 
-    def get_partition_unit_size(self, param):
+
+    def get_partition_unit_size(self, param_size):
         dp_partition_count = self.get_partition_count("os")    
-        assert param.ds_numel % dp_partition_count == 0
-        return param.ds_numel // dp_partition_count
+        assert param_size % dp_partition_count == 0, f"param realy size: {param_size}, dp_partition_count: {dp_partition_count}"
+        return param_size // dp_partition_count
 
     def init_zero35_process_group(self):
         my_zero35_group = None
-        for i in range(self.mode_parallel_size):
+
+        for i in range(self.model_parallel_size):
             for j in range(self.num_zero35_parallel_group):
                 ranks = [
-                    i + (j * self.zero35_parallel_size + k) * self.mode_parallel_size
+                    i + (j * self.zero35_parallel_size + k) * self.model_parallel_size
                     for k in range(self.zero35_parallel_size)
                 ]
                 group = dist.new_group(ranks)
 
                 if dist.get_rank() in ranks:
                     my_zero35_group = group
-                    zero35_debug(ranks, force=True)
+
         return my_zero35_group
 
     def get_sub_p_g_parition(self, ds_param, grad=None):
         assert hasattr(ds_param, 'ds_numel'), 'get_sub_p_g_parition input must be ds_param'
-        if self._enable_zero35:
+        if self.enable_zero35:
             zero35_rank = dist.get_rank() // self.zero35_parallel_size  # TODO, remove hard code
             partition_unit_size = self.get_partition_unit_size(ds_param.ds_numel)
             if grad is not None:

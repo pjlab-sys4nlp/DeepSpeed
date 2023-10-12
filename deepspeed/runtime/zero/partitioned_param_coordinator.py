@@ -16,7 +16,7 @@ from deepspeed.runtime.zero.partitioned_param_profiler import PartitionedParamet
 from deepspeed.runtime.swap_tensor.partitioned_param_swapper import PartitionedParamStatus
 from deepspeed.utils.debug import debug_module2name_id, debug_param2name_id
 from deepspeed.accelerator import get_accelerator
-from deepspeed_wgt.runtime.zero.zero35_utils import zero35_g_p_all_gather_coalesced
+from deepspeed.runtime.zero.zero35_utils import zero35_g_p_all_gather_coalesced
 
 import logging
 
@@ -320,7 +320,7 @@ class PartitionedParameterCoordinator:
 forward:{forward}, skip: {self.all_gahter_count} get : {param}!", flush=True)
                         # TODO: 这个时候需要用gather到的参数覆盖当前param的值
                     else:
-                        zero35_g_p_all_gather_coalesced([param], self._dp_dp_comm_group, self._param_process_group) # partition_type
+                        zero35_g_p_all_gather_coalesced([param]) # partition_type
                         zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, now_mico_step_id:{self.now_mico_step_id()}, forward:{forward}, \
 do _dist_allgather_fn finish: {self.all_gahter_count} get : {param}!", flush=True)
 

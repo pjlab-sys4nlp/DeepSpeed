@@ -321,7 +321,7 @@ class DeepSpeedZeRoOffload(object):
                      mpu=mpu,
                      zero_param_parallel_group=self.zero_param_parallel_group,
                      zero_quantized_weights=self.zero_quantized_weights,
-                     zero_quantized_nontrainable_weights=self.zero_quantized_nontrainable_weights)
+                     zero_quantized_nontrainable_weights=self.zero_quantized_nontrainable_weights,)
 
     def destroy(self):
         self._remove_module_hooks()

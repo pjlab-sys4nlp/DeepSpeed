@@ -29,7 +29,10 @@ from deepspeed.accelerator import get_accelerator
 
 
 from deepspeed.runtime.zero.zero35_utils import zero35_g_p_reduce_scatter_coalesced, \
-    zero35_g_p_all_gather_coalesced, zero35_debug, global_zero35_manager
+    zero35_g_p_all_gather_coalesced, zero35_debug
+
+global_zero35_manager = None
+# from deepspeed.runtime.zero import global_zero35_manager
 
 # Toggle this to true to enable correctness test
 # with gradient partitioning and without
@@ -121,6 +124,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         zero_hpz_partition_size=1,
         zero_quantized_weights=False,
         zero_quantized_nontrainable_weights=False,
+        enable_zero35=False
     ):
         see_memory_usage("Stage 3 initialize beginning", force=True)
 
@@ -174,6 +178,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if self.zero_hpz_partition_size > 1 and zero_param_parallel_group is None:
             self._set_zero_group_parallelism()
             zero_param_parallel_group = groups._get_zero_param_intra_parallel_group()
+
+        global global_zero35_manager
+        if global_zero35_manager is None:
+            global_zero35_manager = get_global_zero35_manager(enable_zero35=enable_zero35, mpu=mpu)
+
+        self._param_partition_unit_size = []
 
         self.parameter_offload = self.initialize_ds_offload(
             module=module,
@@ -255,9 +265,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             assert self.communication_data_type in valid_reduce_scatter_dtypes, f"ZeRO-3 supports {valid_reduce_scatter_dtypes} communication_data_type with reduce scatter enabled. Got: '{self.communication_data_type}'"
             assert self.gradient_predivide_factor == 1.0, "gradient_predivide_factor != 1.0 is not yet supported with ZeRO-3 with reduce scatter enabled"
             assert self.postscale_gradients, "pre-scale gradients is not yet supported with ZeRO-3 with reduce scatter enabled"
-
-        if self.enable_zero35:
-            assert global_zero35_manager is not None
 
         # Holds the mode parameter
         # The param.data may not hold any meaningful data
@@ -655,17 +662,26 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 # record sub group and partitions
                 self.fp16_groups.append(sub_group)
                 self.fp16_partitioned_groups.append([param.ds_tensor for param in sub_group])
+                self._param_partition_unit_size.append([param.unit_partition_size for param in sub_group])
+
+                if global_zero35_manager and global_zero35_manager.enable_zero35:
+                    self.fp16_partitioned_groups_flat_numel.append(sum(p.partition_numel(parition_type="os") for p in sub_group))
+                    param_process_group = global_zero35_manager._param_process_group
+                else:
+                    # record total elements of parameter partitions in sub group
+                    self.fp16_partitioned_groups_flat_numel.append(sum(p.partition_numel() for p in sub_group))
+                    param_process_group = self.dp_process_group
 
                 # record sub group -> group mapping
                 self.sub_group_to_group_id[sub_group_idx] = param_group_idx
 
-                # record total elements of parameter partitions in sub group
-                self.fp16_partitioned_groups_flat_numel.append(sum(p.partition_numel(parition_type="os") for p in sub_group))
-
                 # record padding required to align group to world size (only applies to last rank)
-                rank_requires_padding = dist.get_rank(
-                    self.dp_process_group) == dist.get_world_size(self.dp_process_group) - 1
-                self.groups_padding.append([p.padding_size() if rank_requires_padding else 0 for p in sub_group])
+                rank_requires_padding = dist.get_rank(param_process_group) == dist.get_world_size(param_process_group) - 1
+
+                if global_zero35_manager and global_zero35_manager.enable_zero35:
+                    self.groups_padding.append([p.padding_size(parition_type="os") if rank_requires_padding else 0 for p in sub_group])
+                else:
+                    self.groups_padding.append([p.padding_size() if rank_requires_padding else 0 for p in sub_group])
 
         # move parameters to flattened buffer
         if not self.offload_param:  # partitioned params remain in GPU during training
@@ -885,6 +901,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 sub_group = []
                 local_sub_group_size = 0
 
+        import pdb
+        pdb.set_trace()
         return sub_groups
 
     def _release_ipg_buffers(self):
@@ -896,6 +914,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
         self.optimizer.param_groups[param_group_id]['params'] = [fp32_param]
 
+        import pdb
+        pdb.set_trace()
         self.optimizer.step()
         self.optimizer.param_groups[param_group_id]['params'] = []
 
@@ -932,6 +952,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         largest_numel = max([sum([p.ds_numel for p in psg]) for psg in self.fp16_partitioned_groups])
 
+        global global_zero35_manager
         if global_zero35_manager.enable_zero35:
             scale_unit = dist.get_world_size() // global_zero35_manager.zero35_parallel_size
             old_largest_numel = largest_numel
@@ -1177,12 +1198,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             else:
                 self.params_in_ipg_bucket.sort(key=lambda p: p.ds_id)
                 grad_partitions = self.__avg_scatter_grads(self.params_in_ipg_bucket)
-
-            # (TODO):wgt
-            if global_zero35_manager.enable_zero35:
-                scatter_parition_grads = self.__avg_scatter_grads(self.params_in_ipg_bucket, partition_type="grad")
-                self.partition_grads(self.params_in_ipg_bucket, scatter_parition_grads)
-            else:
                 self.partition_grads(self.params_in_ipg_bucket, grad_partitions)
 
             self.params_in_ipg_bucket.clear()
@@ -1234,6 +1249,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             grad_offset_in_buffer += grad.numel()
 
         return grad_partitions
+    
+    def zero35_judge_grad_boundary(self):
+        return self.micro_step_id == self.gradient_accumulation_steps - 1
 
     @instrument_w_nvtx
     def __avg_scatter_grads(self, params_to_reduce: List[Parameter]) -> List[Tensor]:
@@ -1246,43 +1264,45 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if self.postscale_gradients and self.gradient_predivide_factor != 1.0:
             full_grads_for_rank = [g.div(self.gradient_predivide_factor) for g in full_grads_for_rank]
 
+        if global_zero35_manager is not None and global_zero35_manager.enable_zero35:
+            import copy
+            tensor_list_debug =  copy.deepcopy(full_grads_for_rank)
 
-        if self.micro_step_id != self.gradient_accumulation_steps - 1:
-            # 梯度累加
-            # 假设 dp_world_size = 8, 每个节点只有4张卡
-            # os 切分: 
-            #       节点1: [[0], [1], [2], [3]], 节点2: [[4], [5], [6], [7]]
-            # grad/param切分: 
-            #       节点1：[[0, 4], [1, 5] ,[2, 6], [3, 7]], 节点2: [[0, 4], [1, 5] ,[2, 6], [3, 7]]
-            # [[0, 1, 2, 3], [4, 5, 6, 7]] -> [[0], 1, 2, 3,  [16], 5, 6, 7]
-            # [[0, 1, 2, 3], [4, 5, 6, 7]] -> [0, [4], 2, 3,  4, [20], 6, 7]
-            # [[0, 1, 2, 3], [4, 5, 6, 7]] -> [0, 1, [8], 3,  4, 5, [24], 7]
-            # [[0, 1, 2, 3], [4, 5, 6, 7]] -> [0, 1, 2, [12], 4, 5, 6, [28]]]
-            tensor_list, scatter_comm_group = zero35_g_p_reduce_scatter_coalesced(tensor_list, 
-                                                dp_comm_group=self.get_dp_process_group(partition_type="os"),
-                                                param_comm_group=self.get_dp_process_group(partition_type="grad"),
-                                                partition_type="grad")
+            if not self.zero35_judge_grad_boundary():
+                # 梯度累加
+                # 假设 dp_world_size = 8, 每个节点只有4张卡
+                # os 切分: 
+                #       节点1: [[0], [1], [2], [3]], 节点2: [[4], [5], [6], [7]]
+                # grad/param切分: 
+                #       节点1：[[0, 4], [1, 5] ,[2, 6], [3, 7]], 节点2: [[0, 4], [1, 5] ,[2, 6], [3, 7]]
+                # [[0, 1, 2, 3], [4, 5, 6, 7]] -> [[0], 1, 2, 3,  [16], 5, 6, 7]
+                # [[0, 1, 2, 3], [4, 5, 6, 7]] -> [0, [4], 2, 3,  4, [20], 6, 7]
+                # [[0, 1, 2, 3], [4, 5, 6, 7]] -> [0, 1, [8], 3,  4, 5, [24], 7]
+                # [[0, 1, 2, 3], [4, 5, 6, 7]] -> [0, 1, 2, [12], 4, 5, 6, [28]]]
+                full_grads_for_rank, scatter_comm_group = zero35_g_p_reduce_scatter_coalesced(full_grads_for_rank, partition_type="grad")
 
-            zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, mico_step: {self.micro_step_id}, \
-before __avg_scatter_grads : {self.__avg_scatter_grads_count}, \
-before grad_tensor_list: {tensor_list_debug},  \
-after grad_tensor_list : {tensor_list}", flush=True)
+                zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, mico_step: {self.micro_step_id}, \
+    before __avg_scatter_grads, \
+    before grad_tensor_list: {tensor_list_debug},  \
+    after grad_tensor_list : {full_grads_for_rank}", flush=True)
+            else:
+                # boundary
+                # 在 boundary 阶段，进行 dp 范围的 reduce-scatter，
+                # [0, 1, 2, 3, 4, 5, 6, 7]  -> [[0], 1, 2, 3, 4, 5, 6, 7]
+                # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, [8], 2, 3, 4, 5, 6, 7]
+                # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, 1, [16], 3, 4, 5, 6, 7]
+                # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, 1, 2, [24], 4, 5, 6, 7]
+                # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, 1, 2, 3, [32], 5, 6, 7]
+                # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, 1, 2, 3, 4, [40], 6, 7]
+                # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, 1, 2, 3, 4, 5, [48], 7]
+                # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, 1, 2, 3, 4, 5, 6, [56]]
+                zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, mico_step: {self.micro_step_id}, \
+    skip zero35_g_p_reduce_scatter_coalesced, \
+    before __avg_scatter_grads, \
+    before grad_tensor_list", flush=True)
+                scatter_comm_group = global_zero35_manager.get_dp_process_group(partition_type="os")
         else:
-            # boundary
-            # 在 boundary 阶段，进行 dp 范围的 reduce-scatter，
-            # [0, 1, 2, 3, 4, 5, 6, 7]  -> [[0], 1, 2, 3, 4, 5, 6, 7]
-            # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, [8], 2, 3, 4, 5, 6, 7]
-            # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, 1, [16], 3, 4, 5, 6, 7]
-            # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, 1, 2, [24], 4, 5, 6, 7]
-            # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, 1, 2, 3, [32], 5, 6, 7]
-            # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, 1, 2, 3, 4, [40], 6, 7]
-            # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, 1, 2, 3, 4, 5, [48], 7]
-            # [0, 1, 2, 3, 4, 5, 6, 7]  -> [0, 1, 2, 3, 4, 5, 6, [56]]
-            zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, mico_step: {self.micro_step_id}, \
-skip zero35_g_p_reduce_scatter_coalesced, \
-before __avg_scatter_grads : {self.__avg_scatter_grads_count},\n \
-before grad_tensor_list", flush=True)
-            scatter_comm_group = self.get_dp_process_group(partition_type="os")
+            scatter_comm_group = self.dp_process_group
 
         local_world_size = get_accelerator().device_count()
         global_world_size = dist.get_world_size()
@@ -1290,9 +1310,9 @@ before grad_tensor_list", flush=True)
         if self.all2all_process_group is not None and num_nodes > 1:
             grad_partitions_for_rank = all_to_all_quant_reduce(full_grads_for_rank, self.all2all_process_group)
         else:
-            zero35_debug(f"before __avg_scatter_grads: {tensor_list}", flush=True)
+            zero35_debug(f"before __avg_scatter_grads: {full_grads_for_rank}", flush=True)
             grad_partitions_for_rank = reduce_scatter_coalesced(full_grads_for_rank, scatter_comm_group)
-            zero35_debug(f"after __avg_scatter_grads: {tensor_list}", flush=True)
+            zero35_debug(f"after __avg_scatter_grads: {full_grads_for_rank}", flush=True)
 
         if self.postscale_gradients and self.gradient_predivide_factor != 1.0 and self.gradient_predivide_factor != dist.get_world_size(
                 self.dp_process_group):
@@ -1308,7 +1328,10 @@ before grad_tensor_list", flush=True)
             current_offset = 0
             for param in group:
                 param_id = self.get_param_id(param)
-                num_elements = param.partition_numel()
+                if global_zero35_manager is None or global_zero35_manager.enable_zero35 is False:
+                    num_elements = param.partition_numel()
+                else:
+                    num_elements = param.partition_numel(parition_type="param")
 
                 self.grad_position[param_id] = [int(i), int(current_offset), int(num_elements)]
                 #print(f"param id {param_id} i:{i}, ds_tensor {num_elements} numel {param.numel()}")
@@ -1371,9 +1394,9 @@ before grad_tensor_list", flush=True)
 
             if global_zero35_manager.enable_zero35:
                 if self.micro_step_id == self.gradient_accumulation_steps - 1:  # bounary
-                    grad_rank = dist.get_rank(self.get_dp_process_group(partition_type="os"))
+                    grad_rank = dist.get_rank(global_zero35_manager.get_dp_process_group(partition_type="os"))
                 else:
-                    grad_rank = dist.get_rank(self.get_dp_process_group(partition_type="grad"))
+                    grad_rank = dist.get_rank(global_zero35_manager.get_dp_process_group(partition_type="grad"))
                 contains_real_data = param.partition_numel(parition_type="grad") * grad_rank < param.ds_numel
             else:
                 contains_real_data = param.partition_numel() * dist.get_rank(self.dp_process_group) < param.ds_numel
@@ -2015,6 +2038,13 @@ before grad_tensor_list", flush=True)
             self.unscale_and_clip_grads(sub_group_id, scaled_global_grad_norm)
 
             #apply the optimizer step on the sub group and copy fp32 parameters to fp16
+            if os.environ['SLURM_PROCID'] == '0':
+                import pdb
+                pdb.set_trace()
+            else:
+                import time
+                time.sleep(100000)
+            
             self._optimizer_step(sub_group_id)
 
             #put fp16 parameters in appropriate location
