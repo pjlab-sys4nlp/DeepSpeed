@@ -21,7 +21,7 @@ from deepspeed.runtime.zero.zero35_utils import zero35_g_p_all_gather_coalesced
 import logging
 
 ENABLE_PROFILER = False
-
+ENBALE_MEM_DEBUG = False
 
 def debug_rank0(message: str) -> None:
     if dist.get_rank() == 0:
@@ -131,7 +131,7 @@ class PartitionedParameterCoordinator:
         # （TODO):wgt
         self.is_gradient_accumulation_boundary = True
         self.mico_step_id = 0
-        self.gradient_accumulation_steps = 1
+        self.gradient_accumulation_steps = None
         self.all_gahter_count = 0
         self.enable_zero35 = enable_zero35
 
@@ -272,6 +272,8 @@ class PartitionedParameterCoordinator:
         2. kick off fetch for next few parameters we will need later (prefetch)
         3. block on parameters in immediately required sub module
         """
+        # import pdb;
+        # pdb.set_trace()
         if logger.isEnabledFor(logging.DEBUG):
             zero35_debug(f"Rank: {os.environ['SLURM_PROCID']} do fetch_sub_module!", flush=True)
             debug_rank0(
@@ -282,6 +284,7 @@ class PartitionedParameterCoordinator:
                     "inflight": [p.ds_id for p in self.__inflight_param_registry],
                 }))
 
+        see_memory_usage(f"before fetch_sub_module, forward:{forward}", force=ENBALE_MEM_DEBUG)
         params_to_fetch = frozenset(iter_params(current_submodule))
 
         if self.enable_zero35:
@@ -415,6 +418,8 @@ class PartitionedParameterCoordinator:
                     self.__prefetch_nvme_param_partitions()
 
         self.__step_id += 1
+        see_memory_usage(f"after fetch_sub_module, forward:{forward}", force=ENBALE_MEM_DEBUG)
+
 
     @instrument_w_nvtx
     @torch.no_grad()
