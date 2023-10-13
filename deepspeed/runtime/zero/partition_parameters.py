@@ -50,9 +50,9 @@ def restore_param(__param):
     # TODO:(wgt)
     if __param.ds_tensor.is_first_fwd_all_gahter == True:
         zero35_debug(f"now ds_tensor numel: {__param.ds_tensor.ds_numel}, backup numel: {__param.ds_numel_backup}")
-        zero35_debug(f"now ds_tensor data: {__param.ds_tensor.data}, backup data: {__param.ds_tensor_backup.data}")
+        zero35_debug(f"now ds_tensor data: {__param.ds_tensor.data}, backup data: {__param.ds_tensor_backup}")
 
-        __param.ds_tensor.data = __param.ds_tensor_backup.data
+        __param.ds_tensor.data = __param.ds_tensor_backup
         __param.ds_tensor.is_first_fwd_all_gahter = False
         __param.ds_tensor.ds_numel = __param.ds_numel_backup
     return __param
@@ -665,11 +665,12 @@ class AllGatherCoalescedHandle:
                     part_to_copy = self.partitions[rank].narrow(0, param_offset,
                                                                 min(param.ds_numel - param_start, ds_tensor_numel))
                     partitions.append(part_to_copy)
-            param.data = instrument_w_nvtx(torch.cat)(partitions).view(param.ds_shape)
-            param.ds_status = ZeroParamStatus.AVAILABLE
 
             if global_zero35_manager.enable_zero35:
                 param = restore_param(param)
+
+            param.data = instrument_w_nvtx(torch.cat)(partitions).view(param.ds_shape)
+            param.ds_status = ZeroParamStatus.AVAILABLE
 
             for part_to_copy in partitions:
                 if not get_accelerator().is_synchronized_device():

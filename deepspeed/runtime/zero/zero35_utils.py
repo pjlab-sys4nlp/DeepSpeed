@@ -138,7 +138,7 @@ def zero35_g_p_all_gather_coalesced(tensor_list, partition_type=None):
         # indexs = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15]
         indexs=torch.tensor(indexs).to(get_accelerator().device_name())
         reshape_t_data = torch.index_select(param_full_tensor, 0, indexs)
-        reshape_t_data = reshape_t_data.view(-1)
+        reshape_t_data = reshape_t_data.view(t_data.data.shape)
         assert reshape_t_data.is_contiguous()
 
         # param_full_tensor.ds_tensor = reshape_t_data
