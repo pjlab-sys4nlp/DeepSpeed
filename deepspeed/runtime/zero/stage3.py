@@ -389,6 +389,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         if dist.get_rank(group=self.dp_process_group) == 0:
             see_memory_usage(f"After initializing ZeRO optimizer", force=True)
+        
+    def is_enable_zero35(self):
+        return 'enable_zero35' in os.environ
 
     def destroy(self):
         self.parameter_offload.destroy()
@@ -426,7 +429,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                                     mpu=mpu,
                                     zero_param_parallel_group=zero_param_parallel_group,
                                     zero_quantized_weights=zero_quantized_weights,
-                                    zero_quantized_nontrainable_weights=zero_quantized_nontrainable_weights)
+                                    zero_quantized_nontrainable_weights=zero_quantized_nontrainable_weights,
+                                    enable_zero35=self.is_enable_zero35())
 
     def _get_trainable_parameter_groups(self):
         param_groups = []

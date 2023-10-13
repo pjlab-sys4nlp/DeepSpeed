@@ -84,6 +84,7 @@ class PartitionedParameterCoordinator:
         timers=None,
         zero_quantized_weights=False,
         zero_quantized_nontrainable_weights=False,
+        enable_zero35=False,
     ) -> None:
         # mapping of param -> handle for each param that is currently in flight
         self.__inflight_param_registry = inflight_param_registry
@@ -132,6 +133,7 @@ class PartitionedParameterCoordinator:
         self.mico_step_id = 0
         self.gradient_accumulation_steps = 1
         self.all_gahter_count = 0
+        self.enable_zero35 = enable_zero35
 
     """Tracing and Tracking
     TODO. consider performing trace before initializing PartitionedParameterCoordinator
@@ -281,7 +283,14 @@ class PartitionedParameterCoordinator:
                 }))
 
         params_to_fetch = frozenset(iter_params(current_submodule))
-        fetch_numel = sum([p.partition_numel(parition_type="param") for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
+
+        if self.enable_zero35:
+            parition_type = "param"
+        else:
+            parition_type = None
+
+        fetch_numel = sum([p.partition_numel(parition_type=parition_type) for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
+
         if fetch_numel > 0:
             event_name = __class__.FORWARD_FETCH_SUBMIT if forward else __class__.BACKWARD_FETCH_SUBMIT
             self._dump_param_ids(event_name, current_submodule.id,
@@ -304,7 +313,7 @@ class PartitionedParameterCoordinator:
             if logger.isEnabledFor(logging.DEBUG):
                 debug_rank0(f"-wait: {param.ds_summary()}")
             if param in self.__inflight_param_registry:
-                wait_numel += param.partition_numel(parition_type="param")
+                wait_numel += param.partition_numel(parition_type=parition_type)
                 with get_accelerator().stream(self.__allgather_stream):
                     while self.__ongoing_fetch_events and self.__ongoing_fetch_events[0].query():
                         self.__ongoing_fetch_events.popleft()
@@ -313,16 +322,15 @@ class PartitionedParameterCoordinator:
 
                     self.__inflight_param_registry.pop(param).wait()
 
-                    # 在每个micro_step 的第一次fwd时需要做全局的 all-gather
-                    # 在后续的 fwd/bwd 只需要做节点内的 all-gahter
-                    if self.now_mico_step_id() == 0 and forward:
-                        zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, now_mico_step_id:{self.now_mico_step_id()}, \
-forward:{forward}, skip: {self.all_gahter_count} get : {param}!", flush=True)
-                        # TODO: 这个时候需要用gather到的参数覆盖当前param的值
-                    else:
-                        zero35_g_p_all_gather_coalesced([param]) # partition_type
-                        zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, now_mico_step_id:{self.now_mico_step_id()}, forward:{forward}, \
-do _dist_allgather_fn finish: {self.all_gahter_count} get : {param}!", flush=True)
+                    if self.enable_zero35:
+                        if self.now_mico_step_id() == 0 and forward:
+                            # 在每个micro_step 的第一次fwd时需要做全局的 all-gather
+                            zero35_debug(f"now_mico_step_id:{self.now_mico_step_id()}, forward:{forward}, skip at count: {self.all_gahter_count} get: {param}!", flush=True)
+                            # TODO:  参数从 from os-partition to param-partition，只影响正确性，不影响性能测试
+                        else:
+                            # 在后续的 fwd/bwd 只需要做节点内的 all-gahter
+                            zero35_g_p_all_gather_coalesced([param]) # partition_type
+                            zero35_debug(f"now_mico_step_id:{self.now_mico_step_id()}, forward:{forward}, do reshape finish at count: {self.all_gahter_count} get: {param}!", flush=True)
 
                     self.all_gahter_count += 1
 

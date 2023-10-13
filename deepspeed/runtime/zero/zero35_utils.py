@@ -10,14 +10,7 @@ from deepspeed.runtime.swap_tensor.partitioned_param_swapper import PartitionedP
 
 import torch
 
-
-def get_global_zero35_manager(enable_zero35=False, mpu=None):
-    global global_zero35_manager
-    if global_zero35_manager is None:
-        print("init GlobalZero35GroupManager!!", flush=True)
-        global_zero35_manager = GlobalZero35GroupManager(enable_zero35=enable_zero35, mpu=mpu)
-    else:
-        return global_zero35_manager
+init_count = 0
 
 FORCE = False
 def zero35_debug(msg, rank=None, force=FORCE, flush=True):
@@ -93,7 +86,6 @@ def zero35_g_p_reduce_scatter_coalesced(tensor_list, partition_type):
     return tensor_list, scatter_comm_group
 
 def zero35_g_p_all_gather_coalesced(tensor_list, partition_type=None):
-    pass
     # reshape 的逻辑
     # [0, 4, 1, 5, 2, 6, 3, 7]  -> [0, 1, 2, 3, 4, 5, 6, 7]  
     # [0, 4, 1, 5, 2, 6, 3, 7]  -> [0, 1, 2, 3, 4, 5, 6, 7] 
@@ -227,10 +219,6 @@ ranks:{dist.get_all_ranks_from_group(self.zero35_group)}")
         else:
             assert False, f"unkonwn partition_type: {partition_type}"
 
-    # @property
-    def get_partition_count(self, partition_type):
-        return dist.get_world_size(group=self.get_dp_process_group(partition_type))
-
     def get_dp_process_group(self, partition_type):
         """ Return the communication group with all data-parallel ranks """
         if partition_type == "os":
@@ -295,7 +283,7 @@ ranks:{dist.get_all_ranks_from_group(self.zero35_group)}")
                 return grad
             else:
                 return ds_param.ds_tensor
-            
+
     def zero35_judge_gahter_boundary(self, mico_step, forward):
         return mico_step == 0 and forward
             
@@ -332,3 +320,32 @@ ranks:{dist.get_all_ranks_from_group(self.zero35_group)}")
             zero35_debug(f"zero35_hack_allgahter_ds_tensor DEBUG: mico_step: {mico_step}, forward:{forward}, SKIP hack, partition_unit_size:{partition_unit_size}", flush=True)
 
         return partition_unit_size
+
+
+    def zero35_restore_allgahter_ds_tensor(__param):
+        # TODO:(wgt)
+        if __param.ds_tensor.is_first_fwd_all_gahter == True:
+            zero35_debug(f"now ds_tensor numel: {__param.ds_tensor.ds_numel}, backup numel: {__param.ds_numel_backup}")
+            zero35_debug(f"now ds_tensor data: {__param.ds_tensor.data}, backup data: {__param.ds_tensor_backup}")
+
+            __param.ds_tensor.data = __param.ds_tensor_backup
+            __param.ds_tensor.is_first_fwd_all_gahter = False
+            __param.ds_tensor.ds_numel = __param.ds_numel_backup
+        return __param
+
+    # @property
+    def num_partitions(self, partition_type):
+        return dist.get_world_size(group=self.get_dp_process_group(partition_type))
+
+
+def get_global_zero35_manager(enable_zero35=None, mpu=None) -> GlobalZero35GroupManager:
+    global global_zero35_manager
+    if global_zero35_manager is None:
+        print(f"init GlobalZero35GroupManager!!, init_count: {init_count}", flush=True)
+        init_count += 1
+        if enable_zero35 is None:
+            enable_zero35 = 'enable_zero35' in os.environ
+        global_zero35_manager = GlobalZero35GroupManager(enable_zero35=enable_zero35, mpu=mpu)
+    else:
+        return global_zero35_manager
+

@@ -46,18 +46,6 @@ zero_init_context = 0
 top_level_context = None
 
 
-def restore_param(__param):
-    # TODO:(wgt)
-    if __param.ds_tensor.is_first_fwd_all_gahter == True:
-        zero35_debug(f"now ds_tensor numel: {__param.ds_tensor.ds_numel}, backup numel: {__param.ds_numel_backup}")
-        zero35_debug(f"now ds_tensor data: {__param.ds_tensor.data}, backup data: {__param.ds_tensor_backup}")
-
-        __param.ds_tensor.data = __param.ds_tensor_backup
-        __param.ds_tensor.is_first_fwd_all_gahter = False
-        __param.ds_tensor.ds_numel = __param.ds_numel_backup
-    return __param
-
-
 class NoGatherHandle:
 
     def __init__(self, param: Parameter) -> None:
@@ -607,7 +595,7 @@ class AllGatherHandle:
         self.__param.ds_status = ZeroParamStatus.AVAILABLE
 
         if global_zero35_manager.enable_zero35:
-            self.__param = restore_param(self.__param)
+            self.__param = get_global_zero35_manager().zero35_restore_allgahter_ds_tensor(self.__param)
 
 class AllGatherCoalescedHandle:
 
@@ -667,7 +655,7 @@ class AllGatherCoalescedHandle:
                     partitions.append(part_to_copy)
 
             if global_zero35_manager.enable_zero35:
-                param = restore_param(param)
+                param = get_global_zero35_manager().zero35_restore_allgahter_ds_tensor(param)
 
             param.data = instrument_w_nvtx(torch.cat)(partitions).view(param.ds_shape)
             param.ds_status = ZeroParamStatus.AVAILABLE
@@ -1358,7 +1346,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             assert global_zero35_manager.enable_zero35 is True
             return self._zero35_padding_size(param, parition_type)
 
-        def partition_numel():
+        def partition_numel(parition_type=None):
             assert global_zero35_manager is None or global_zero35_manager.enable_zero35 is False
             return self._partition_numel(param)
 
@@ -2231,7 +2219,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         if partition_type is None:
             return self.dp_world_size
         else:
-            return global_zero35_manager.get_partition_count(partition_type)
+            return global_zero35_manager.num_partitions(partition_type)
 
     def get_dp_process_group(self):
         """ Return the communication group with all data-parallel ranks """
