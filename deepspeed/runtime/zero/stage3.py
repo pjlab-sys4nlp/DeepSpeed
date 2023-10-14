@@ -740,9 +740,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 # record sub group and partitions
                 self.fp16_groups.append(sub_group)
                 self.fp16_partitioned_groups.append([param.ds_tensor for param in sub_group])
-                self._param_partition_unit_size.append([param.unit_partition_size for param in sub_group])
 
                 if global_zero35_manager and global_zero35_manager.enable_zero35:
+                    self._param_partition_unit_size.append([param.unit_partition_size for param in sub_group])
                     self.fp16_partitioned_groups_flat_numel.append(sum(p.partition_numel(parition_type="os") for p in sub_group))
                     param_process_group = global_zero35_manager._param_process_group
                 else:

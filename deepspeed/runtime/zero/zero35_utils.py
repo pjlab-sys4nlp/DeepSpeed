@@ -222,6 +222,7 @@ class GlobalZero35GroupManager:
             self._grad_world_size = dist.get_world_size(group=self._grad_process_group)
 
         else:
+            self.zero35_group = None
             self._grad_process_group = self._dp_process_group
             self._param_process_group = self._dp_process_group
             
