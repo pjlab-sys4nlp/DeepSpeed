@@ -39,7 +39,7 @@ global_zero35_manager = None
 pg_correctness_test = False
 
 ENBALE_MEM_DEBUG = False
-ENBALE_COMM_DEBUG = True
+ENBALE_COMM_DEBUG = False
 
 OPTIMIZER_SWAP_IN_STATE_TIMER = 'optimizer_swap_in_state'
 INIT_OPTIMIZER_TIMER = 'init_optimizer_state'
@@ -1024,12 +1024,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         largest_numel = max([sum([p.ds_numel for p in psg]) for psg in self.fp16_partitioned_groups])
 
-        global global_zero35_manager
-        if global_zero35_manager.enable_zero35:
-            scale_unit = dist.get_world_size() // global_zero35_manager.zero35_parallel_size
-            old_largest_numel = largest_numel
-            largest_numel = largest_numel * scale_unit
-            # zero35_debug(f"old_largest_numel: {old_largest_numel}, largest_numel:{largest_numel}, scale_unit:{scale_unit}", flush=True, force=True)
+        # global global_zero35_manager
+        # if global_zero35_manager.enable_zero35:
+        #     scale_unit = dist.get_world_size() // global_zero35_manager.zero35_parallel_size
+        #     old_largest_numel = largest_numel
+        #     largest_numel = largest_numel * scale_unit
+        #     zero35_debug(f"old_largest_numel: {old_largest_numel}, largest_numel:{largest_numel}, scale_unit:{scale_unit}", flush=True, force=True)
 
         gradient_dtype = self.fp32_partitioned_groups_flat[0].dtype
         gradient_buffer = torch.zeros(int(largest_numel), dtype=gradient_dtype, device=self.device)
@@ -1158,6 +1158,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         # start of this method.
         # TODO. make this less error prone
         self.micro_step_id += 1
+        self._get_param_coordinator(training=True).micro_step_id += 1
 
     def overlapping_partition_gradients_reduce_epilogue(self):
         self.independent_gradient_partition_epilogue()
@@ -1752,6 +1753,7 @@ size: {numels* full_grads_for_rank[0].element_size()/ (1024**2):.4f} MB", flush=
         Zero FP16 parameter grads.
         """
         self.micro_step_id = 0
+        self._get_param_coordinator(training=True).micro_step_id = 0
 
         # FP32 grad should never exist.
         # For speed, set model fp16 grad to None by default
@@ -1881,6 +1883,7 @@ size: {numels* full_grads_for_rank[0].element_size()/ (1024**2):.4f} MB", flush=
 
     def _pre_step(self):
         self.micro_step_id = 0
+        self._get_param_coordinator(training=True).micro_step_id = 0
 
         print_rank_0(f"Inside Step function")
         see_memory_usage(f"In step before checking overflow", force=False)

@@ -231,7 +231,7 @@ class GlobalZero35GroupManager:
             self._grad_rank = 0
             self._grad_world_size = 1
 
-        # zero35_debug(f"zero35_parallel_size: {self.zero35_parallel_size}, num_zero35_parallel_group:{self.num_zero35_parallel_group}, ranks:{dist.get_all_ranks_from_group(self.zero35_group)}")
+        zero35_debug(f"zero35_parallel_size: {self.zero35_parallel_size}, num_zero35_parallel_group:{self.num_zero35_parallel_group}, ranks:{dist.get_all_ranks_from_group(self.zero35_group)}", force=True)
 
 
     def get_partition_dp_group(self, param, partition_type):
@@ -308,11 +308,11 @@ class GlobalZero35GroupManager:
             zero35_rank = dist.get_rank() // self.zero35_parallel_size  # TODO, remove hard code
             partition_unit_size = self.get_partition_unit_size(ds_param.ds_numel)
             if grad is not None:
-                reshape_grad = grad.reshape(-1, partition_unit_size)[zero35_rank]
+                reshape_grad = grad.view(-1, partition_unit_size)[zero35_rank]
                 assert reshape_grad.storage().data_ptr() == grad.storage().data_ptr()
                 return reshape_grad
             else:
-                reshape_param = ds_param.ds_tensor.reshape(-1, partition_unit_size)[zero35_rank]
+                reshape_param = ds_param.ds_tensor.view(-1, partition_unit_size)[zero35_rank]
                 assert reshape_param.storage().data_ptr() == ds_param.ds_tensor.storage().data_ptr()
                 return reshape_param
         else:

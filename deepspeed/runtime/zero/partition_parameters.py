@@ -45,7 +45,7 @@ partitioned_param_data_shape = [0]
 zero_init_context = 0
 top_level_context = None
 ENBALE_MEM_DEBUG = False
-ENBALE_COMM_DEBUG = True
+ENBALE_COMM_DEBUG = False
 
 class NoGatherHandle:
 
@@ -1164,6 +1164,14 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     requires_grad=False,
                 )
                 if not quantize:
+
+                    if ENBALE_COMM_DEBUG:
+                        if dist.get_rank() == 0:
+                            print(f"mico_step:{mico_step}, forward:{forward}, all_gather_coalesced:  \
+    comm_group:{dist.get_world_size(ds_process_group)} \
+    nums:{param_buffer.numel()}, \
+    size: {param_buffer.numel() * param_buffer.element_size()/ (1024**2):.4f} MB", flush=True)
+
                     handles = _dist_allgather_fn(
                         param_ds_tensor.to(get_accelerator().current_device_name()),
                         param_buffer,
@@ -1234,6 +1242,14 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                         instrument_w_nvtx(
                             torch.cat)([p.ds_tensor.to(get_accelerator().current_device_name()) for p in params],
                                        out=partitions[rank_in_group])
+                        
+                    if ENBALE_COMM_DEBUG:
+                        if dist.get_rank() == 0:
+                            print(f"mico_step:{mico_step}, forward:{forward}, all_gather_coalesced:  \
+    comm_group:{dist.get_world_size(ds_process_group)} \
+    nums:{flat_tensor.numel()}, \
+    size: {flat_tensor.numel() * flat_tensor.element_size()/ (1024**2):.4f} MB", flush=True)
+
                     handle = _dist_allgather_fn(partitions[rank_in_group], flat_tensor, ds_process_group)
                     #Fix get_partition_dp_group(params[0]))
 
@@ -1950,7 +1966,6 @@ size: {output_tensor.numel() * output_tensor.element_size()/ (1024**2):.4f} MB",
 
             if ENBALE_COMM_DEBUG:
                 if dist.get_rank() == 0:
-                    output_tensor = allgather_params[param_idx]
                     print(f"_allgather_params_coalesced, param_idx:{param_idx} \
 comm_group:{dist.get_world_size(all_gather_process_group)} \
 nums:{gather_size}, \

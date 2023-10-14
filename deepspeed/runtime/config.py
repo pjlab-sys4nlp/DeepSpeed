@@ -776,7 +776,7 @@ class DeepSpeedConfig(object):
 
     def _initialize_params(self, param_dict):
         self.train_batch_size = get_train_batch_size(param_dict)
-        #print(f"beginning get_train_batch_size = {get_train_batch_size}")
+        print(f"beginning get_train_batch_size = {self.train_batch_size}", flush=True)
         self.train_micro_batch_size_per_gpu = get_train_micro_batch_size_per_gpu(param_dict)
         self.gradient_accumulation_steps = get_gradient_accumulation_steps(param_dict)
         self.steps_per_print = get_steps_per_print(param_dict)
@@ -914,6 +914,7 @@ class DeepSpeedConfig(object):
 
         # global_accumulation_steps needs to be set
         elif train_batch is not None and micro_batch is not None:
+            print(f"cal acc grad step!! : train_batch:{train_batch}, micro_batch:{micro_batch}, self.world_size:{self.world_size}", flush=True)
             grad_acc = train_batch // micro_batch
             grad_acc //= self.world_size
             self.gradient_accumulation_steps = grad_acc

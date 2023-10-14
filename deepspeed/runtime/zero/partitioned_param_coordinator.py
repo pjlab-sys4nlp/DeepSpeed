@@ -130,7 +130,7 @@ class PartitionedParameterCoordinator:
 
         # （TODO):wgt
         self.is_gradient_accumulation_boundary = True
-        self.mico_step_id = 0
+        self.micro_step_id = 0
         self.gradient_accumulation_steps = None
         self.all_gahter_count = 0
         self.enable_zero35 = enable_zero35
@@ -145,7 +145,7 @@ class PartitionedParameterCoordinator:
     """
 
     def now_mico_step_id(self): # （TODO):wgt
-        return self.mico_step_id % self.gradient_accumulation_steps
+        return self.micro_step_id
 
     def _clear_trace_structures(self) -> None:
         self.__submodule_order = []
