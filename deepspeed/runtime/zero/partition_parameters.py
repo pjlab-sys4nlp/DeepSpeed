@@ -45,6 +45,7 @@ partitioned_param_data_shape = [0]
 zero_init_context = 0
 top_level_context = None
 ENBALE_MEM_DEBUG = False
+ENBALE_COMM_DEBUG = True
 
 class NoGatherHandle:
 
@@ -899,7 +900,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             self.num_ranks_in_param_group = groups._get_zero_param_intra_parallel_group_world_size()
             self.num_param_groups = int(self.dp_world_size / self.num_ranks_in_param_group)
             self.rank_in_group = groups._get_zero_param_intra_parallel_rank_in_mygroup()
-            print_rank_0(f"hpZeRO group size? {self.num_ranks_in_param_group}", force=ENBALE_MEM_DEBUG)
+            print_rank_0(f"hpZeRO group size? {self.num_ranks_in_param_group}", force=True)
 
             logger.debug(
                 "hpZeRO partition parameter my rank in world {} my rank in group {} ranks in my param partition group: {} "
@@ -920,7 +921,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         self.module = module
         if (self.quantized_weights or self.quantized_nontrainable_weights):
             self.quantizer_module = CUDAQuantizer()
-            print_rank_0(f'Using quantizer for weights: {self.quantizer_module.__class__.__name__}', force=ENBALE_MEM_DEBUG)
+            print_rank_0(f'Using quantizer for weights: {self.quantizer_module.__class__.__name__}', force=True)
 
         if _ds_config is not None:
             Init.override_module_apply = _ds_config.zero_config.override_module_apply
@@ -1524,7 +1525,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         assert param.ds_status is not ZeroParamStatus.INFLIGHT, f" {param} Cannot partition a param in flight"
         global reuse_buffers
         print_rank_0(f"Param id {param.ds_id} status is {param.ds_status}", force=False)
-        zero35_debug(f"do _zero35_partition_param!")
+        # # zero35_debug(f"do _zero35_partition_param!")
 
         param_comm_group = global_zero35_manager._param_process_group
         dp_comm_group =  global_zero35_manager._dp_process_group
@@ -1582,11 +1583,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             offset = unit_partition_size * self.get_partition_rank(partition_type="param")
             one_dim_param = param.contiguous().view(-1)
 
-            zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, partition_unit_num: {partition_unit_num}, partition_stride:{partition_stride}, offset:{offset}, ", flush=True)
+            # # zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, partition_unit_num: {partition_unit_num}, partition_stride:{partition_stride}, offset:{offset}, ", flush=True)
             for pdx in range(partition_unit_num):
                 start = offset + partition_stride * pdx
                 sub_start = unit_partition_size * pdx
-                zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, pdx:{pdx},start: {start}, sub_start:{sub_start}" , flush=True)
+                # # zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, pdx:{pdx},start: {start}, sub_start:{sub_start}" , flush=True)
 
                 if global_zero35_manager.get_rank_in_group(partition_type="param") == param_num_partitions -1 \
                     and pdx == partition_unit_num - 1:   # 只有最后一块 1/dp 的 parition unit 需要补齐 padding
@@ -1595,12 +1596,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     param.ds_tensor[sub_start:sub_start+unit_partition_size] = one_dim_param[start:start+unit_partition_size]
 
             # if os.environ['SLURM_PROCID'] == '0':
-            zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, parition param done {param.ds_tensor}", flush=True)
+            # # zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, parition param done {param.ds_tensor}", flush=True)
 
             see_memory_usage(f'Before partitioning param {param.ds_id} {param.shape}', force=ENBALE_MEM_DEBUG)
-            zero35_debug(f"Before partitioning param ID {param.ds_id} partitioned type {param.dtype} dev {param.device} shape {param.shape}")
+            # # zero35_debug(f"Before partitioning param ID {param.ds_id} partitioned type {param.dtype} dev {param.device} shape {param.shape}")
             free_param(param)
-            zero35_debug(f"After partitioning param ID {param.ds_id} partitioned type {param.dtype} dev {param.device} shape {param.shape}")
+            # # zero35_debug(f"After partitioning param ID {param.ds_id} partitioned type {param.dtype} dev {param.device} shape {param.shape}")
             see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}', force=ENBALE_MEM_DEBUG)
 
     @instrument_w_nvtx
@@ -1915,6 +1916,14 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             else:
                 all_gather_process_group = self.get_partition_dp_group(param_list[0])
 
+            if ENBALE_COMM_DEBUG:
+                if dist.get_rank() == 0:
+                    output_tensor = allgather_params[param_idx]
+                    print(f"_allgather_params_coalesced, param_idx:{param_idx} \
+comm_group:{dist.get_world_size(all_gather_process_group)} \
+nums:{output_tensor.numel()}, \
+size: {output_tensor.numel() * output_tensor.element_size()/ (1024**2):.4f} MB", flush=True)
+
             if self.use_all_gather_into_tensor:
                 # try the _all_gather_base from Pytorch master
                 h = dist.all_gather_into_tensor(allgather_params[param_idx],
@@ -1929,13 +1938,23 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     launch_quantize_handles.append(quantize_handle)
             else:
                 output_list = []
+                gather_size = 0
                 for i in range(num_partitions):
                     psize = partition_sizes[param_idx]
+                    gather_size += psize
                     partition = allgather_params[param_idx].narrow(0, i * psize, psize)
                     output_list.append(partition)
                     if not get_accelerator().on_accelerator(partition):
                         logger.warning(
                             f'param {param_idx}, partition {i} is not on CUDA, partition shape {partition.size()}')
+
+            if ENBALE_COMM_DEBUG:
+                if dist.get_rank() == 0:
+                    output_tensor = allgather_params[param_idx]
+                    print(f"_allgather_params_coalesced, param_idx:{param_idx} \
+comm_group:{dist.get_world_size(all_gather_process_group)} \
+nums:{gather_size}, \
+size: {gather_size* input_tensor.element_size()/ (1024**2):.4f} MB", flush=True)
 
                 # back to old all_gather function
                 h = dist.all_gather(output_list, input_tensor, group=all_gather_process_group, async_op=True)
@@ -1978,7 +1997,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         partition_size = sum([param.ds_tensor.ds_numel for param in param_list])
 
         if global_zero35_manager.enable_zero35:
-            print("Warning: zero35调用了_allgather_params函数", flush=True)
+            # print("Warning: zero35调用了_allgather_params函数", flush=True)
             num_partitions = self.zero35_num_partitions(partition_type="param")
             partition_rank = self.get_partition_rank(partition_type="param")
             partition_dp_group = global_zero35_manager.get_partition_dp_group(param_list[0], partition_type="param")
@@ -2025,6 +2044,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                                    param_scale_numel).copy_(param.ds_tensor.ds_quant_scale.data)
 
                         offset += param_scale_numel
+
+        if ENBALE_COMM_DEBUG:
+            if dist.get_rank() == 0:
+                print(f"_allgather_params, comm_group:{dist.get_world_size(partition_dp_group)} nums:{flat_tensor.numel()}, size: {flat_tensor.numel()*flat_tensor.element_size()/ (1024**2):.4f} MB", flush=True)
 
         dist.all_gather(partitions,
                         partitions[partition_rank],

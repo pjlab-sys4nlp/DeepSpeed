@@ -16,7 +16,7 @@ from deepspeed.runtime.zero.partitioned_param_profiler import PartitionedParamet
 from deepspeed.runtime.swap_tensor.partitioned_param_swapper import PartitionedParamStatus
 from deepspeed.utils.debug import debug_module2name_id, debug_param2name_id
 from deepspeed.accelerator import get_accelerator
-from deepspeed.runtime.zero.zero35_utils import zero35_g_p_all_gather_coalesced
+from deepspeed.runtime.zero.zero35_utils import zero35_g_p_all_gather_coalesced, zero35_debug
 
 import logging
 
@@ -275,7 +275,7 @@ class PartitionedParameterCoordinator:
         # import pdb;
         # pdb.set_trace()
         if logger.isEnabledFor(logging.DEBUG):
-            zero35_debug(f"Rank: {os.environ['SLURM_PROCID']} do fetch_sub_module!", flush=True)
+            # zero35_debug(f"Rank: {os.environ['SLURM_PROCID']} do fetch_sub_module!", flush=True)
             debug_rank0(
                 f"{self.__step_id}: M{current_submodule.id}({type(current_submodule).__name__}) P{[p.ds_id for p in iter_params(current_submodule)]} "
                 + str({
@@ -328,12 +328,13 @@ class PartitionedParameterCoordinator:
                     if self.enable_zero35:
                         if self.now_mico_step_id() == 0 and forward:
                             # 在每个micro_step 的第一次fwd时需要做全局的 all-gather
-                            zero35_debug(f"now_mico_step_id:{self.now_mico_step_id()}, forward:{forward}, skip at count: {self.all_gahter_count} get: {param}!", flush=True)
+                            # zero35_debug(f"now_mico_step_id:{self.now_mico_step_id()}, forward:{forward}, skip at count: {self.all_gahter_count} get: {param}!", flush=True)
                             # TODO:  参数从 from os-partition to param-partition，只影响正确性，不影响性能测试
+                            pass
                         else:
                             # 在后续的 fwd/bwd 只需要做节点内的 all-gahter
                             zero35_g_p_all_gather_coalesced([param]) # partition_type
-                            zero35_debug(f"now_mico_step_id:{self.now_mico_step_id()}, forward:{forward}, do reshape finish at count: {self.all_gahter_count} get: {param}!", flush=True)
+                            # zero35_debug(f"now_mico_step_id:{self.now_mico_step_id()}, forward:{forward}, do reshape finish at count: {self.all_gahter_count} get: {param}!", flush=True)
 
                     self.all_gahter_count += 1
 

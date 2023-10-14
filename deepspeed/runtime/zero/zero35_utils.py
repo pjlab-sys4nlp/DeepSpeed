@@ -79,35 +79,35 @@ def zero35_g_p_reduce_scatter_coalesced(tensor_list, partition_type):
     if do_reshape:
         scatter_comm_group = param_comm_group
 
-        dp_world_size = dist.get_world_size(dp_comm_group)
-        param_world_size = dist.get_world_size(param_comm_group)
+        # dp_world_size = dist.get_world_size(dp_comm_group)
+        # param_world_size = dist.get_world_size(param_comm_group)
 
-        new_tensor_list = []
-        _undo_indexs_for_per_tensor = []
-        for grad in tensor_list:
-            assert grad.numel() % dp_world_size == 0
-            assert grad.numel() % param_world_size == 0
+        # new_tensor_list = []
+        # _undo_indexs_for_per_tensor = []
+        # for grad in tensor_list:
+        #     assert grad.numel() % dp_world_size == 0
+        #     assert grad.numel() % param_world_size == 0
 
-            dp_partition_size = int(grad.numel() / dp_world_size)  # 按照dp范围划分的最小part大小
-            param_partition_size = int(grad.numel() / param_world_size)
-            assert param_partition_size % dp_partition_size == 0
-            param_partition_num = int(param_partition_size / dp_partition_size)  # 每个节点内包含的 dp_partition_size 的数量
-            grad = grad.reshape(-1, dp_partition_size)
-            indexs = []
-            for idx in range(param_world_size):
-                for jdx in range(param_partition_num):
-                    indexs.append(idx + jdx * param_world_size)
+        #     dp_partition_size = int(grad.numel() / dp_world_size)  # 按照dp范围划分的最小part大小
+        #     param_partition_size = int(grad.numel() / param_world_size)
+        #     assert param_partition_size % dp_partition_size == 0
+        #     param_partition_num = int(param_partition_size / dp_partition_size)  # 每个节点内包含的 dp_partition_size 的数量
+        #     grad = grad.reshape(-1, dp_partition_size)
+        #     indexs = []
+        #     for idx in range(param_world_size):
+        #         for jdx in range(param_partition_num):
+        #             indexs.append(idx + jdx * param_world_size)
 
-            zero35_debug(f"scatter index : {indexs}")
+        #     # zero35_debug(f"scatter index : {indexs}")
 
-            indexs=torch.tensor(indexs).to(get_accelerator().device_name())
-            _, undo_indices = torch.sort(indexs, dim=0, descending=False)
-            _undo_indexs_for_per_tensor.append(undo_indices)
+        #     indexs=torch.tensor(indexs).to(get_accelerator().device_name())
+        #     _, undo_indices = torch.sort(indexs, dim=0, descending=False)
+        #     _undo_indexs_for_per_tensor.append(undo_indices)
 
-            reshape_grad = torch.index_select(grad, 0, indexs)
-            assert reshape_grad.is_contiguous()
-            new_tensor_list.append(reshape_grad.view(-1))
-        tensor_list = new_tensor_list
+        #     reshape_grad = torch.index_select(grad, 0, indexs)
+        #     assert reshape_grad.is_contiguous()
+        #     new_tensor_list.append(reshape_grad.view(-1))
+        # tensor_list = new_tensor_list
     else:
         scatter_comm_group = dp_comm_group
 
@@ -151,7 +151,7 @@ def zero35_g_p_all_gather_coalesced(tensor_list, partition_type=None):
 
     #     partition_unit_size = t_data.numel() // dp_world_size  # 按照dp范围划分的最小part大小
 
-    #     zero35_debug(f"param_full_tensor.numel() :{t_data.numel()}, dp_world_size:{dp_world_size},partition_unit_size:{partition_unit_size}", flush=True)
+    #     # zero35_debug(f"param_full_tensor.numel() :{t_data.numel()}, dp_world_size:{dp_world_size},partition_unit_size:{partition_unit_size}", flush=True)
 
     #     partition_unit_num = t_data.numel() // partition_unit_size
 
@@ -164,7 +164,7 @@ def zero35_g_p_all_gather_coalesced(tensor_list, partition_type=None):
     #     for idx in range(partition_unit_num_per_rank): # 8
     #         indexs.extend([idx + jdx * partition_unit_num_per_rank for jdx in range(param_world_size)])
 
-    #     zero35_debug(f"gather index : {indexs}")
+    #     # zero35_debug(f"gather index : {indexs}")
     #     # indexs = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15]
     #     indexs=torch.tensor(indexs).to(get_accelerator().device_name())
     #     reshape_t_data = torch.index_select(param_full_tensor, 0, indexs)
@@ -231,9 +231,7 @@ class GlobalZero35GroupManager:
             self._grad_rank = 0
             self._grad_world_size = 1
 
-        zero35_debug(f"zero35_parallel_size: {self.zero35_parallel_size}, \
-num_zero35_parallel_group:{self.num_zero35_parallel_group}, \
-ranks:{dist.get_all_ranks_from_group(self.zero35_group)}")
+        # zero35_debug(f"zero35_parallel_size: {self.zero35_parallel_size}, num_zero35_parallel_group:{self.num_zero35_parallel_group}, ranks:{dist.get_all_ranks_from_group(self.zero35_group)}")
 
 
     def get_partition_dp_group(self, param, partition_type):
@@ -353,11 +351,11 @@ ranks:{dist.get_all_ranks_from_group(self.zero35_group)}")
             param.ds_tensor.final_location = None
             param.ds_tensor.is_first_fwd_all_gahter = True
 
-            zero35_debug(f"zero35_hack_allgahter_ds_tensor DEBUG: mico_step: {mico_step}, forward:{forward}, param.ds_numel : {param.ds_numel}, get : {param_ds_tensor}, partition_type:{partition_type}, partition_unit_size:{partition_unit_size}", flush=True)
+            # zero35_debug(f"zero35_hack_allgahter_ds_tensor DEBUG: mico_step: {mico_step}, forward:{forward}, param.ds_numel : {param.ds_numel}, get : {param_ds_tensor}, partition_type:{partition_type}, partition_unit_size:{partition_unit_size}", flush=True)
         else:
             partition_type = "param"
             partition_unit_size = param.ds_tensor.ds_numel
-            zero35_debug(f"zero35_hack_allgahter_ds_tensor DEBUG: mico_step: {mico_step}, forward:{forward}, SKIP hack, partition_unit_size:{partition_unit_size}", flush=True)
+            # zero35_debug(f"zero35_hack_allgahter_ds_tensor DEBUG: mico_step: {mico_step}, forward:{forward}, SKIP hack, partition_unit_size:{partition_unit_size}", flush=True)
 
         see_memory_usage(f"after zero35_hack_allgahter_ds_tensor, mico_step:{mico_step}, forward:{forward}")
         return partition_unit_size
@@ -366,8 +364,8 @@ ranks:{dist.get_all_ranks_from_group(self.zero35_group)}")
     def zero35_restore_allgahter_ds_tensor(self, __param):
         # TODO:(wgt)
         if __param.ds_tensor.is_first_fwd_all_gahter == True:
-            zero35_debug(f"now ds_tensor numel: {__param.ds_tensor.ds_numel}, backup numel: {__param.ds_numel_backup}")
-            zero35_debug(f"now ds_tensor data: {__param.ds_tensor.data}, backup data: {__param.ds_tensor_backup}")
+            # zero35_debug(f"now ds_tensor numel: {__param.ds_tensor.ds_numel}, backup numel: {__param.ds_numel_backup}")
+            # zero35_debug(f"now ds_tensor data: {__param.ds_tensor.data}, backup data: {__param.ds_tensor_backup}")
 
             __param.ds_tensor.data = __param.ds_tensor_backup
             __param.ds_tensor.is_first_fwd_all_gahter = False
