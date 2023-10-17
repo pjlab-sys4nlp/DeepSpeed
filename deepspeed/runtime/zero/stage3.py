@@ -1271,7 +1271,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 grad_partitions = self.__avg_scatter_contiguous_grads(grad_bucket)
             else:
                 self.params_in_ipg_bucket.sort(key=lambda p: p.ds_id)
-                grad_partitions = self.__avg_scatter_grads(self.params_in_ipg_bucket)
+                if global_zero35_manager.enable_zero35 and global_zero35_manager.hierarchical_allgather:
+                    grad_partitions = self.__avg_scatter_grads_hierarchical(self.params_in_ipg_bucket)
+                else:
+                    grad_partitions = self.__avg_scatter_grads(self.params_in_ipg_bucket)
                 self.partition_grads(self.params_in_ipg_bucket, grad_partitions)
 
             self.params_in_ipg_bucket.clear()
@@ -1390,6 +1393,66 @@ size: {numels* full_grads_for_rank[0].element_size()/ (1024**2):.4f} MB", flush=
             # # zero35_debug(f"before __avg_scatter_grads: {full_grads_for_rank}", flush=True)
             grad_partitions_for_rank = reduce_scatter_coalesced(full_grads_for_rank, scatter_comm_group)
             # # zero35_debug(f"after __avg_scatter_grads: {full_grads_for_rank}", flush=True)
+
+        if self.postscale_gradients and self.gradient_predivide_factor != 1.0 and self.gradient_predivide_factor != dist.get_world_size(
+                self.dp_process_group):
+            grad_partitions_for_rank = [g.mul(self.gradient_predivide_factor) for g in grad_partitions_for_rank]
+
+        if self.communication_data_type != self.dtype:
+            grad_partitions_for_rank = [g.to(self.dtype) for g in grad_partitions_for_rank]
+
+        see_memory_usage(f"after __avg_scatter_grads, boundary: {self.zero35_judge_grad_boundary()}", force=ENBALE_MEM_DEBUG)
+
+        return grad_partitions_for_rank
+
+
+    @instrument_w_nvtx
+    def __avg_scatter_grads_hierarchical(self, params_to_reduce: List[Parameter]) -> List[Tensor]:
+        see_memory_usage(f"before __avg_scatter_grads, boundary: {self.zero35_judge_grad_boundary()}", force=ENBALE_MEM_DEBUG)
+        full_grads_for_rank = [p.grad for p in params_to_reduce]
+
+        if self.communication_data_type != self.dtype:
+            full_grads_for_rank = [g.to(self.communication_data_type) for g in full_grads_for_rank]
+
+        if self.postscale_gradients and self.gradient_predivide_factor != 1.0:
+            full_grads_for_rank = [g.div(self.gradient_predivide_factor) for g in full_grads_for_rank]
+
+        inter_comm_group = global_zero35_manager.zero35_hierarchical_group
+        intra_comm_group = global_zero35_manager.zero35_group
+
+        assert dist.get_world_size(intra_comm_group) == 8
+        assert global_zero35_manager.enable_zero35 is True
+
+        def count_list_params_numel(grads_list):
+            all_numel = 0
+            for grad in grads_list:
+                all_numel += grad.numel()
+            return all_numel
+
+        if global_zero35_manager is not None and global_zero35_manager.enable_zero35:
+            if not self.zero35_judge_grad_boundary():
+                # full_grads_for_rank, scatter_comm_group = zero35_g_p_reduce_scatter_coalesced(full_grads_for_rank, partition_type="grad")
+                # Replace
+                grad_partitions_for_rank = reduce_scatter_coalesced(full_grads_for_rank, intra_comm_group)
+            else:
+                # boundary
+                # inter reduce-scatter
+                zero35_debug(f"before first educe_scatter: {count_list_params_numel(full_grads_for_rank)}", force=False)
+                grad_partitions_for_rank = reduce_scatter_coalesced(full_grads_for_rank, inter_comm_group)
+                zero35_debug(f"after first educe_scatter: {count_list_params_numel(grad_partitions_for_rank)}", force=False)
+
+                # Replace
+                # intra reduce-scatter
+                grad_partitions_for_rank = reduce_scatter_coalesced(grad_partitions_for_rank, intra_comm_group)
+                zero35_debug(f"after sec educe_scatter: {count_list_params_numel(grad_partitions_for_rank)}", force=False)
+
+        if ENBALE_COMM_DEBUG:
+            if dist.get_rank() == 0:
+                numels = sum([p.numel() for p in full_grads_for_rank])
+                print(f"__avg_scatter_grads, \
+comm_group:{dist.get_world_size(scatter_comm_group)} \
+nums:{numels}, \
+size: {numels* full_grads_for_rank[0].element_size()/ (1024**2):.4f} MB", flush=True)
 
         if self.postscale_gradients and self.gradient_predivide_factor != 1.0 and self.gradient_predivide_factor != dist.get_world_size(
                 self.dp_process_group):

@@ -9,6 +9,10 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 from deepspeed.runtime.swap_tensor.partitioned_param_swapper import PartitionedParamStatus
+from deepspeed.utils import instrument_w_nvtx, logger
+from typing import Callable, Iterable
+from torch.nn import Parameter
+
 
 import torch
 
@@ -18,7 +22,6 @@ FORCE = False
 
 torch_memory_reserved = get_accelerator().memory_reserved
 torch_max_memory_reserved = get_accelerator().max_memory_reserved
-
 
 # avoid circular reference
 def see_memory_usage(message, force=False):
@@ -190,8 +193,9 @@ class GlobalZero35GroupManager:
         self.enable_zero35 = enable_zero35
         self._dp_process_group = dist.get_world_group()
         self._os_rank = dist.get_rank()
-
+        self.hierarchical_allgather = 'hierarchical' in os.environ
         self.world_size = dist.get_world_size(self._dp_process_group)
+        self.local_device = torch.device(get_accelerator().device_name(os.environ["LOCAL_RANK"]))
 
         if mpu is not None:
             self.model_parallel_group = mpu.get_model_parallel_group()
@@ -216,6 +220,7 @@ class GlobalZero35GroupManager:
 
         if self.enable_zero35:
             self.zero35_group = self.init_zero35_process_group()
+            self.zero35_hierarchical_group = self.init_zero35_hierarchical_process_group()
             self._grad_process_group = self.zero35_group
             self._param_process_group = self.zero35_group
 
@@ -227,6 +232,7 @@ class GlobalZero35GroupManager:
 
         else:
             self.zero35_group = None
+            self.zero35_hierarchical_group = None
             self._grad_process_group = self._dp_process_group
             self._param_process_group = self._dp_process_group
             
@@ -234,6 +240,12 @@ class GlobalZero35GroupManager:
             self._param_world_size = 1
             self._grad_rank = 0
             self._grad_world_size = 1
+        
+        if dist.get_rank() < 8:
+            print(f"Rank:{dist.get_rank()} zero35_hierarchical_group: {dist.get_all_ranks_from_group(self.zero35_hierarchical_group)}", flush=True)
+        
+        if self.hierarchical_allgather:
+            assert self._param_world_size == 8, "hierarchical_allgather only support param shared 8!"
 
         zero35_debug(f"zero35_parallel_size: {self.zero35_parallel_size}, num_zero35_parallel_group:{self.num_zero35_parallel_group}, ranks:{dist.get_all_ranks_from_group(self.zero35_group)}", force=True)
 
@@ -305,6 +317,20 @@ class GlobalZero35GroupManager:
                     my_zero35_group = group
 
         return my_zero35_group
+
+    def init_zero35_hierarchical_process_group(self):
+        my_hierarchical_zero35_group = None
+        gpus_per_node = 8
+        nnodes = self.world_size // 8
+
+        for i in range(gpus_per_node):
+            ranks = [i + 8*j for j in range(nnodes)]
+            group = dist.new_group(ranks)
+            if dist.get_rank() in ranks:
+                my_hierarchical_zero35_group = group
+        
+        return my_hierarchical_zero35_group
+
 
     def get_sub_p_g_parition(self, ds_param, grad=None):
         assert hasattr(ds_param, 'ds_numel'), 'get_sub_p_g_parition input must be ds_param'
@@ -379,6 +405,122 @@ class GlobalZero35GroupManager:
     # @property
     def num_partitions(self, partition_type):
         return dist.get_world_size(group=self.get_dp_process_group(partition_type))
+
+
+    @instrument_w_nvtx
+    def zero35_hierarchical_all_gather_params(self, params: Iterable[Parameter],
+                                forward: bool = True,
+                                safe_mode: bool = False,
+                                quantize: bool = False,
+                                mico_step: int = 1):
+
+        params_buffers = None
+
+        # self._ensure_availability_of_partitioned_params(params)
+        from deepspeed.runtime.zero.mics import MiCS_AllGatherCoalescedHandle
+        from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+
+        for param in params:
+            if param.ds_status != ZeroParamStatus.NOT_AVAILABLE:
+                raise RuntimeError(param.ds_summary())
+            param.ds_status = ZeroParamStatus.INFLIGHT
+
+        # ensure that each rank has params in same order. the allgather
+        # is done by flattening the parameter list into a single tensor that
+        # can be allgathered in a single call - this means that if each rank
+        # gives a list of the same parameters in a different order we will
+        # silently get incorrect parameter values, and have very difficult
+        # to debug correctness issues.
+        params = sorted(params, key=lambda p: p.ds_id)
+
+        local_rank = dist.get_rank(group=self.zero35_group)
+        inter_node_comm_group = self.zero35_hierarchical_group
+        intra_node_comm_group = self.zero35_group
+        intra_param_shard_size = dist.get_world_size(intra_node_comm_group)
+        assert intra_param_shard_size == 8
+
+        dp_param_shard_size = dist.get_world_size()
+
+        inter_node_size = dist.get_world_size(group=inter_node_comm_group)
+        intra_node_size = dist.get_world_size(group=intra_node_comm_group)
+        param_tensors = []
+        for i, p in enumerate(params):
+            self.zero35_hack_allgahter_ds_tensor(p, mico_step, forward)
+            param_size = p.ds_tensor.ds_numel * dp_param_shard_size  # unit_size * dp world size
+            #zero35_debug(F"param_size :{param_size / dp_param_shard_size}, intra_param_shard_size: {intra_param_shard_size}, dp_param_shard_size, :{dp_param_shard_size/dp_param_shard_size}, p.ds_tensor.ds_numel:{p.ds_tensor.ds_numel/dp_param_shard_size}, p.ds_tensor.ds_shape:{p.ds_shape}", force=True)
+            if params_buffers is not None and params_buffers[i] is not None:
+                assert params_buffers[i].numel(
+                ) == param_size, f'param_buffers[{i}] size {params_buffers[i].numel()} does not match with param_size {param_size}'
+                param_tensor = params_buffers[i]
+            else:
+                param_tensor = torch.empty(param_size, dtype=p.dtype, device=self.local_device,
+                                           requires_grad=False).view(-1)
+            param_tensors.append(param_tensor)
+
+        # inter node all-gather
+        inter_outputs = []
+        inter_inputs = []
+        try:
+            for i, p in enumerate(params):
+                inter_size = p.ds_tensor.ds_numel * inter_node_size
+                #zero35_debug(f"p.ds_tensor.ds_numel:{p.ds_tensor.ds_numel/dp_param_shard_size}, inter_node_size:{inter_node_size}, inter_size: {inter_size/dp_param_shard_size}, p.ds_tensor.ds_shape:{p.ds_shape}", force=True)
+                _out = param_tensors[i].narrow(0, local_rank * inter_size, inter_size)
+                inter_outputs.append(_out)
+                inter_inputs.append(p.ds_tensor.data.view(-1).to(self.local_device))
+                #zero35_debug(f"inter input unit parma size: {p.ds_tensor.data.numel()/dp_param_shard_size}, inter_size: {inter_size/dp_param_shard_size}", force=True)
+        except Exception as e:
+            import time
+            if dist.get_rank() == 0:
+                print(e, flush=True)
+            time.sleep(10000)
+
+
+        # sync enqueue
+        dist.all_gather_coalesced(inter_outputs, inter_inputs, group=inter_node_comm_group, async_op=False)
+
+        # intra node all-gather
+        intra_outputs = []
+        intra_inputs = []
+        for i, p in enumerate(params):
+            # partition param into multiple chunks for allgather
+            # because inter-node all-gather outputs are in a continues memory
+            # while in param memory, those inter-node data are placed in different
+            # location.
+            # each chunk is an intra-node output
+            try:
+                #zero35_debug(f"inter_node_size:{inter_node_size}, intra_node_size:{intra_node_size}, p.ds_tensor.ds_numel:{p.ds_tensor.ds_numel}, local_rank:{local_rank}", force=True)
+                param_chunk = param_tensors[i].view((inter_node_size, intra_node_size, p.ds_tensor.ds_numel)).narrow(1, local_rank, 1)
+                param_chunk.copy_(inter_outputs[i].detach().clone().view(param_chunk.size()))
+                output_chunks = torch.chunk(param_tensors[i], inter_node_size)
+                for j, _out in enumerate(output_chunks):
+                    intra_chunk_size = intra_node_size * p.ds_tensor.ds_numel
+                    local_offset = local_rank * p.ds_tensor.ds_numel
+                    #zero35_debug(f"intra input unit parma size: {p.ds_tensor.data.numel()/dp_param_shard_size}, intra_chunk_size: {intra_chunk_size/dp_param_shard_size}", force=True)
+                    _in = param_tensors[i].narrow(0, j * intra_chunk_size + local_offset, p.ds_tensor.ds_numel)
+                    intra_outputs.append(_out)
+                    intra_inputs.append(_in)
+            except Exception as e:
+                import time
+                if dist.get_rank() == 0:
+                    print(e, flush=True)
+                time.sleep(10000)
+
+        all_gather_handle = dist.all_gather_coalesced(intra_outputs,
+                                                      intra_inputs,
+                                                      group=intra_node_comm_group,
+                                                      async_op=True)
+        for i, param in enumerate(params):
+            param.data = param_tensors[i].narrow(0, 0, param.ds_numel).view(param.ds_shape).data
+            #zero35_debug(f"finish pre allgather param.data:{param.data.numel()/dp_param_shard_size}, ds_tensor.numel: {param.ds_tensor.numel()/dp_param_shard_size}", force=True)
+
+        # import time
+        # time.sleep(10000)
+        return MiCS_AllGatherCoalescedHandle(
+            allgather_handle=all_gather_handle,
+            params=params,
+            partitions=[],
+            world_size=intra_param_shard_size,
+        )
 
 
 def get_global_zero35_manager(enable_zero35=None, mpu=None) -> GlobalZero35GroupManager:
