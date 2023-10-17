@@ -1401,9 +1401,20 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             return wrapped
 
+        def zero35_all_gahter_coalesced(params: Iterable[Parameter],
+                                 forward: bool = True,
+                                 safe_mode: bool = False,
+                                 quantize: bool = False,
+                                 mico_step: int = 0):
+            if global_zero35_manager.zero35_judge_gahter_boundary(mico_step, forward) and global_zero35_manager.hierarchical_allgather:
+                return global_zero35_manager.zero35_hierarchical_all_gather_params(params, forward, safe_mode, quantize, mico_step)
+            else:
+                return params[0].backup_all_gather_coalesced(params, forward, safe_mode, quantize, mico_step)
+
         # Collectives for gathering and partitioning parameters
         param.all_gather = all_gather
-        param.all_gather_coalesced = all_gather_coalesced
+        param.all_gather_coalesced = zero35_all_gahter_coalesced
+        param.backup_all_gather_coalesced = all_gather_coalesced
 
         # Collective for averaging gradients
         param.reduce_gradients_at_owner = reduce_gradients_at_owner
