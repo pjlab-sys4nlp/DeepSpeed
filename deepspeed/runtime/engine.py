@@ -855,6 +855,9 @@ class DeepSpeedEngine(Module):
 
     def aio_config(self):
         return self._config.aio_config
+    
+    def enable_zero35(self):
+        return 'enable_zero35' in os.environ
 
     def get_data_types(self):
         model_dtype = torch.float32
@@ -1568,6 +1571,7 @@ class DeepSpeedEngine(Module):
                     zero_hpz_partition_size=self.zero_hpz_partition_size(),
                     zero_quantized_weights=self.zero_quantized_weights(),
                     zero_quantized_nontrainable_weights=self.zero_quantized_nontrainable_weights(),
+                    enable_zero35=self.enable_zero35()
                 )
 
         else:

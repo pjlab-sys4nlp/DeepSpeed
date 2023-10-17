@@ -34,11 +34,18 @@ from deepspeed.utils.debug import (debug_param2name_id_shape, debug_param2name_i
 from deepspeed.accelerator import get_accelerator
 from ..swap_tensor.partitioned_param_swapper import AsyncPartitionedParameterSwapper, PartitionedParamStatus
 from deepspeed.inference.quantization.utils import _quantize_param, WEIGHT_QUANTIZATION_LAYERS, wrap_quantized_functional, wrap_load_from_state_dict
+from deepspeed.runtime.zero.zero35_utils import GlobalZero35GroupManager, zero35_debug, get_global_zero35_manager
+
+# from deepspeed.runtime.zero import global_zero35_manager
+
+global_zero35_manager: GlobalZero35GroupManager = None
+
 
 partitioned_param_data_shape = [0]
 zero_init_context = 0
 top_level_context = None
-
+ENBALE_MEM_DEBUG = False
+ENBALE_COMM_DEBUG = False
 
 class NoGatherHandle:
 
@@ -306,6 +313,7 @@ class InsertPostInitMethodToModuleSubClasses(object):
     def __init__(self, enabled=True, mem_efficient_linear=True, ds_config=None, dtype=None):
         self.mem_efficient_linear = mem_efficient_linear
         self.enabled = enabled
+        self._ds_config = ds_config
         self._set_dtype(ds_config, dtype)
         assert self.dtype in [
             torch.half, torch.bfloat16, torch.float
@@ -587,6 +595,8 @@ class AllGatherHandle:
                 self.__quantization.quantized_param, self.__quantization.scale_buffer).to(self.__param.device)
         self.__param.ds_status = ZeroParamStatus.AVAILABLE
 
+        if global_zero35_manager.enable_zero35:
+            self.__param = get_global_zero35_manager().zero35_restore_allgahter_ds_tensor(self.__param)
 
 class AllGatherCoalescedHandle:
 
@@ -644,6 +654,10 @@ class AllGatherCoalescedHandle:
                     part_to_copy = self.partitions[rank].narrow(0, param_offset,
                                                                 min(param.ds_numel - param_start, ds_tensor_numel))
                     partitions.append(part_to_copy)
+
+            if global_zero35_manager.enable_zero35:
+                param = get_global_zero35_manager().zero35_restore_allgahter_ds_tensor(param)
+
             param.data = instrument_w_nvtx(torch.cat)(partitions).view(param.ds_shape)
             param.ds_status = ZeroParamStatus.AVAILABLE
 
@@ -746,6 +760,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         zero_quantized_nontrainable_weights=False,
         sequence_data_parallel_group=None,
         param_swapper=None,
+        enable_zero35=False
     ):
         """A context to enable massive model construction for training with
         ZeRO-3. Models are automatically partitioned (or, sharded) across the
@@ -868,6 +883,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         self.rank = dist.get_rank(group=self.ds_process_group)
         self.dp_world_size = dist.get_world_size(group=self.ds_process_group)
 
+        global global_zero35_manager
+        if global_zero35_manager is None:
+            global_zero35_manager = get_global_zero35_manager(enable_zero35='enable_zero35' in os.environ, mpu=None)
+
         self.zero_param_process_group = zero_param_parallel_group
         if _ds_config is not None and _ds_config.zero_config.zero_hpz_partition_size > 1 and self.zero_param_process_group is None:
             groups._create_zero_param_parallel_group(_ds_config.zero_config.zero_hpz_partition_size)
@@ -935,11 +954,18 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             logger.info(f"all_gather_into_tensor API is not available in torch {torch.__version__}")
 
     def _update_persist_config(self, ds_config):
+        # persistence_threshold 我们以节点内切分大小为准
+        num_parition = self.num_partitions if global_zero35_manager.enable_zero35 is False else self.zero35_num_partitions(partition_type="param")
         Init.apply_param_persistence = True
         Init.param_persistence_threshold = ds_config.zero_config.param_persistence_threshold
-        Init.model_persistence_threshold = ds_config.zero_config.model_persistence_threshold // self.num_partitions
+        Init.model_persistence_threshold = ds_config.zero_config.model_persistence_threshold // num_parition
 
     def _zero_init_param(self, param):
+
+        global global_zero35_manager
+        if global_zero35_manager is None:
+            global_zero35_manager = get_global_zero35_manager(enable_zero35='enable_zero35' in os.environ, mpu=None)
+
         self._convert_to_deepspeed_param(param)
         if dist.get_world_group() == self.get_dp_process_group():
             dist.broadcast(param, 0, self.get_dp_process_group())
@@ -973,7 +999,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
     def _post_init_method(self, module):
         #see_memory_usage(f"Before converting params in {module.__class__.__name__}", force=False)
         print_rank_0(f'Converting Params in {module.__class__.__name__}', force=False)
-        see_memory_usage(f"Before converting and partitioning params in {module.__class__.__name__}", force=False)
+        see_memory_usage(f"Before converting and partitioning params in {module.__class__.__name__}", force=ENBALE_MEM_DEBUG)
 
         for name, param in module.named_parameters(recurse=False):
             print_rank_0(f'Analyzing param {name} in {module.__class__.__name__}', force=False)
@@ -1017,6 +1043,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         # If this flag is true, then the parameters are replicated throughput training
         # And only partitioned before the step
         if Init.apply_param_persistence and param.ds_numel <= Init.param_persistence_threshold and Init.num_persisted_elements + param.ds_numel <= Init.model_persistence_threshold:
+            if dist.get_rank() == 0:
+                print("warning! ds_persist enbale!", flush=True)
             param.ds_persist = True
             Init.num_persisted_parameters += 1
             Init.num_persisted_elements += param.ds_numel
@@ -1027,6 +1055,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         # The group that the parameter is scattered across.
         param.ds_process_group = self.ds_process_group
+
+        if global_zero35_manager is not None and global_zero35_manager.enable_zero35:
+            param.param_process_group = global_zero35_manager._param_process_group  # mics_comm_groups.param_shard_group
+            param.grad_process_group = global_zero35_manager._grad_process_group   # mics_comm_groups.grad_shard_group
 
         # Stores the secondary partitioned copy of the tensor
         param.ds_secondary_tensor = None
@@ -1054,12 +1086,18 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         def all_gather_coalesced(params: Iterable[Parameter],
                                  forward: bool = True,
                                  safe_mode: bool = False,
-                                 quantize: bool = False) -> AllGatherCoalescedHandle:
+                                 quantize: bool = False,
+                                 mico_step: int = 1) -> AllGatherCoalescedHandle:
 
             # fetches from nvme if the partition is not available and in nvme
             self._ensure_availability_of_partitioned_params(params)
 
-            if self.num_partitions == 1:
+            if global_zero35_manager.enable_zero35:
+                num_partitions = self.zero35_num_partitions(partition_type="param")
+            else:
+                num_partitions = self.num_partitions
+
+            if num_partitions == 1:
                 return _no_gather_coalesced(params)
 
             for param in params:
@@ -1101,6 +1139,19 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             if len(params) == 1:
                 # have an opportunity to avoid some intermediate memory allocations
                 param, = params
+
+                if global_zero35_manager.enable_zero35:
+                    global_zero35_manager.zero35_hack_allgahter_ds_tensor(param, mico_step, forward)
+
+                    if global_zero35_manager.zero35_judge_gahter_boundary(mico_step, forward):
+                        partition_type = "os"
+                    else:
+                        partition_type = "param"
+
+                    ds_process_group = global_zero35_manager.get_dp_process_group(partition_type=partition_type)
+                    rank_in_group = global_zero35_manager.get_rank_in_group(partition_type=partition_type)
+                    world_size = self.zero35_num_partitions(partition_type=partition_type)
+
                 buffer_size = math.ceil(param.ds_numel / world_size) * world_size
                 if not forward and param.ds_secondary_tensor is not None:
                     buffer_size = param.ds_secondary_tensor.shape[0] * world_size  #make sure out is appropriately sized
@@ -1113,6 +1164,14 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     requires_grad=False,
                 )
                 if not quantize:
+
+                    if ENBALE_COMM_DEBUG:
+                        if dist.get_rank() == 0:
+                            print(f"mico_step:{mico_step}, forward:{forward}, all_gather_coalesced:  \
+    comm_group:{dist.get_world_size(ds_process_group)} \
+    nums:{param_buffer.numel()}, \
+    size: {param_buffer.numel() * param_buffer.element_size()/ (1024**2):.4f} MB", flush=True)
+
                     handles = _dist_allgather_fn(
                         param_ds_tensor.to(get_accelerator().current_device_name()),
                         param_buffer,
@@ -1144,12 +1203,25 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     quant_info.quant_handle = quant_handle
                     quant_info.scale_buffer = quant_scale_buffer
                     return AllGatherHandle(handle, param, quantization=quant_info)
-
             else:
-                partition_sz = sum(p.ds_tensor.ds_numel for p in params)
+                if global_zero35_manager.enable_zero35:
+                    partition_sz = 0
+                    for param in params:
+                        partition_sz += global_zero35_manager.zero35_hack_allgahter_ds_tensor(param, mico_step, forward)
 
-                if params[0].ds_secondary_tensor is not None and not forward:
-                    partition_sz = sum(p.ds_tensor.ds_numel * p.ds_secondary_tensor_num_of_groups for p in params)
+                    if global_zero35_manager.zero35_judge_gahter_boundary(mico_step, forward):
+                        partition_type = "os"
+                    else:
+                        partition_type = "param"
+
+                    ds_process_group = global_zero35_manager.get_dp_process_group(partition_type=partition_type)
+                    rank_in_group = global_zero35_manager.get_rank_in_group(partition_type=partition_type)
+                    world_size = self.zero35_num_partitions(partition_type=partition_type)
+                else:
+                    partition_sz = sum(p.ds_tensor.ds_numel for p in params)
+
+                    if params[0].ds_secondary_tensor is not None and not forward:
+                        partition_sz = sum(p.ds_tensor.ds_numel * p.ds_secondary_tensor_num_of_groups for p in params)
 
                 flat_tensor = torch.empty(partition_sz * world_size,
                                           dtype=get_only_unique_item(p.ds_tensor.dtype
@@ -1170,6 +1242,14 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                         instrument_w_nvtx(
                             torch.cat)([p.ds_tensor.to(get_accelerator().current_device_name()) for p in params],
                                        out=partitions[rank_in_group])
+                        
+                    if ENBALE_COMM_DEBUG:
+                        if dist.get_rank() == 0:
+                            print(f"mico_step:{mico_step}, forward:{forward}, all_gather_coalesced:  \
+    comm_group:{dist.get_world_size(ds_process_group)} \
+    nums:{flat_tensor.numel()}, \
+    size: {flat_tensor.numel() * flat_tensor.element_size()/ (1024**2):.4f} MB", flush=True)
+
                     handle = _dist_allgather_fn(partitions[rank_in_group], flat_tensor, ds_process_group)
                     #Fix get_partition_dp_group(params[0]))
 
@@ -1241,6 +1321,14 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 param_list = [cls]
             self._partition(param_list, has_been_updated=has_been_updated)
 
+        def zero35_partition(param_list=None, backward=False, hierarchy=0, has_been_updated=False):
+            cls = param
+            print_rank_0(f"{'--'*hierarchy}----Zero35 Partitioning param {debug_param2name_id_shape_device(cls)}",
+                         force=False)
+            if param_list is None:
+                param_list = [cls]
+            self._zero35_partition(param_list, has_been_updated=has_been_updated)
+
         def reduce_gradients_at_owner(param_list=None, hierarchy=0):
             cls = param
             if param_list is None:
@@ -1264,11 +1352,24 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         def aligned_size():
             return self._aligned_size(param)
 
+        def zero35_aligned_size(parition_type):
+            assert global_zero35_manager.enable_zero35 is True
+            return self._zero35_aligned_size(param, parition_type)
+
         def padding_size():
             return self._padding_size(param)
 
-        def partition_numel():
+        def zero35_padding_size(parition_type):
+            assert global_zero35_manager.enable_zero35 is True
+            return self._zero35_padding_size(param, parition_type)
+
+        def partition_numel(parition_type=None):
+            assert global_zero35_manager is None or global_zero35_manager.enable_zero35 is False
             return self._partition_numel(param)
+
+        def zero35_partition_numel(parition_type):
+            assert global_zero35_manager.enable_zero35 is True
+            return self._zero35_partition_numel(param, parition_type)
 
         def item_override():
             param.all_gather()
@@ -1300,19 +1401,37 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             return wrapped
 
+        def zero35_all_gahter_coalesced(params: Iterable[Parameter],
+                                 forward: bool = True,
+                                 safe_mode: bool = False,
+                                 quantize: bool = False,
+                                 mico_step: int = 0):
+            if global_zero35_manager.zero35_judge_gahter_boundary(mico_step, forward) and global_zero35_manager.hierarchical_allgather:
+                return global_zero35_manager.zero35_hierarchical_all_gather_params(params, forward, safe_mode, quantize, mico_step)
+            else:
+                return params[0].backup_all_gather_coalesced(params, forward, safe_mode, quantize, mico_step)
+
         # Collectives for gathering and partitioning parameters
         param.all_gather = all_gather
-        param.all_gather_coalesced = all_gather_coalesced
-        param.partition = partition
+        param.all_gather_coalesced = zero35_all_gahter_coalesced
+        param.backup_all_gather_coalesced = all_gather_coalesced
 
         # Collective for averaging gradients
         param.reduce_gradients_at_owner = reduce_gradients_at_owner
         param.partition_gradients = partition_gradients
 
         # Partitioning size utilities
-        param.aligned_size = aligned_size
-        param.padding_size = padding_size
-        param.partition_numel = partition_numel
+        if global_zero35_manager.enable_zero35:
+            param.partition_numel = zero35_partition_numel
+            param.partition = zero35_partition
+            param.padding_size = zero35_padding_size
+            param.aligned_size = zero35_aligned_size
+        else:
+            param.partition_numel = partition_numel
+            param.partition = partition
+            param.padding_size = padding_size
+            param.aligned_size = aligned_size
+
         param.ds_summary = types.MethodType(ds_summary, param)
 
         param.item = allgather_before(param.item)
@@ -1322,12 +1441,29 @@ class Init(InsertPostInitMethodToModuleSubClasses):
     def _aligned_size(self, param):
         return param.ds_numel + self._padding_size(param)
 
+    def _zero35_aligned_size(self, param, partition_type):
+        return param.ds_numel + self._zero35_padding_size(param, partition_type)
+
     def _padding_size(self, param):
         remainder = param.ds_numel % self.num_partitions
         return (self.num_partitions - remainder) if remainder else 0
 
+    def _zero35_padding_size(self, param, partition_type):
+        # param group 切分的 parition_unit 的大小要大于 os group
+        # 如何返回正确的 padding ? 
+        remainder = param.ds_numel % self.zero35_num_partitions(partition_type=partition_type)
+        return (self.zero35_num_partitions(partition_type=partition_type) - remainder) if remainder else 0
+
     def _partition_numel(self, param):
         return param.ds_tensor.ds_numel
+
+    def _zero35_partition_numel(self, param, parition_type):
+        if parition_type == "param" or parition_type == "grad":
+            return param.ds_tensor.ds_numel
+        else:
+            dp_world_size = dist.get_world_size()
+            assert param.ds_numel % dp_world_size == 0
+            return param.ds_numel // dp_world_size
 
     def _ensure_availability_of_partitioned_params(self, params):
         swap_in_list = []
@@ -1395,8 +1531,111 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             #    assert id(param.data) == id(param.ds_tensor.data), \
             #    "After the parameters are initially partitioned, make sure we are not recreating the partition."
             #print_rank_0(f"After Partitioning Param {param.ds_id} {param.ds_tensor.size()} {param.ds_tensor}",force=False)
+
+    def _zero35_partition(self, param_list, force=False, has_been_updated=False):
+        for param in param_list:
+            print_rank_0(f"Before Zero35 Partitioning Param {param.ds_id}", force=False)
+            self._zero35_partition_param(param, has_been_updated=has_been_updated)
+            param.ds_status = ZeroParamStatus.NOT_AVAILABLE
+
+    @instrument_w_nvtx
+    def _zero35_partition_param(self, param, buffer=None, has_been_updated=False):
+        """
+        zero35 进行 partition的基本单元是按照 dp 范围切分，这些切分部分我们称之为 'partition_unit'
+        每个rank可能会分到多个 'partition_unit'
+        
+        Args:
+            param (_type_): _description_
+            buffer (_type_, optional): _description_. Defaults to None.
+            has_been_updated (bool, optional): _description_. Defaults to False.
+        """
+        assert param.ds_status is not ZeroParamStatus.INFLIGHT, f" {param} Cannot partition a param in flight"
+        global reuse_buffers
+        print_rank_0(f"Param id {param.ds_id} status is {param.ds_status}", force=False)
+        # # zero35_debug(f"do _zero35_partition_param!")
+
+        param_comm_group = global_zero35_manager._param_process_group
+        dp_comm_group =  global_zero35_manager._dp_process_group
+        param_num_partitions = dist.get_world_size(param_comm_group)
+        dp_num_partitions = dist.get_world_size(dp_comm_group)
+
+        # assert param_num_partitions == 8, "zero35 split param in local node device"
+        # if param_num_partitions != 8:
+        #     print(f"zero35 split param worldisze: {param_num_partitions}", flush=True)
+
+        if param.ds_status is ZeroParamStatus.AVAILABLE:
+            print_rank_0(f"Partitioning param id {param.ds_id} reuse buffers {reuse_buffers}", force=False)
+
+            if param.ds_tensor is not None and not has_been_updated:  ##param already partitioned
+                see_memory_usage(f'Before partitioning param 2:{param.ds_id} {param.shape}', force=False)
+                # param.data does not store anything meaningful in partitioned state
+                free_param(param)
+                see_memory_usage(f'After partitioning param 2:{param.ds_id} {param.shape}', force=False)
+                return
+            
+            tensor_size_param = self._zero35_aligned_size(param, partition_type="param")
+            tensor_size_dp = self._zero35_aligned_size(param, partition_type="os")
+
+            assert tensor_size_dp == tensor_size_param, f"different padding size: tensor_size_dp:{tensor_size_dp} = tensor_size_param: {tensor_size_param}"
+            tensor_size = tensor_size_dp
+
+            partition_size = tensor_size // param_num_partitions
+            unit_partition_size = tensor_size // dp_num_partitions
+
+            assert partition_size % unit_partition_size == 0
+
+            if param.ds_tensor is None:
+                final_location = None
+                # assert param.ds_persist is False, "ds_persist可能会有ug"
+                if param.ds_persist:
+                    device = self.local_device
+                else:
+                    device = self.remote_device
+
+                # buffer 大小仍然是 partition_size 这么大
+                partitioned_tensor = torch.empty(partition_size, dtype=param.dtype, device=device)
+                partitioned_tensor.requires_grad = False
+                param.ds_tensor = partitioned_tensor             # 被切分后的tensor
+                param.ds_tensor.ds_numel = partition_size        # ds_numel 是 buffer大小，等于partition_size，但每个param实际上仍然是被切分了 1/dp 份
+                param.unit_partition_size = unit_partition_size   # 这里存一份 unit_partition_size，给 _unflatten_partitioned_parameters 用
+                param.ds_tensor.is_first_fwd_all_gahter = False
+
+                param.ds_tensor.status = PartitionedParamStatus.AVAILABLE
+                param.ds_tensor.final_location = final_location
+            
+            partition_unit_num = partition_size // unit_partition_size
+
+            assert tensor_size % partition_unit_num == 0
+            partition_stride = tensor_size // partition_unit_num
+            
+            # 这里需要改成分段拷贝
+            offset = unit_partition_size * self.get_partition_rank(partition_type="param")
+            one_dim_param = param.contiguous().view(-1)
+
+            # # zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, partition_unit_num: {partition_unit_num}, partition_stride:{partition_stride}, offset:{offset}, ", flush=True)
+            for pdx in range(partition_unit_num):
+                start = offset + partition_stride * pdx
+                sub_start = unit_partition_size * pdx
+                # # zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, pdx:{pdx},start: {start}, sub_start:{sub_start}" , flush=True)
+
+                if global_zero35_manager.get_rank_in_group(partition_type="param") == param_num_partitions -1 \
+                    and pdx == partition_unit_num - 1:   # 只有最后一块 1/dp 的 parition unit 需要补齐 padding
+                    param.ds_tensor[sub_start:] = one_dim_param[start:]
+                else:
+                    param.ds_tensor[sub_start:sub_start+unit_partition_size] = one_dim_param[start:start+unit_partition_size]
+
+            # if os.environ['SLURM_PROCID'] == '0':
+            # # zero35_debug(f"Rank: {os.environ['SLURM_PROCID']}, parition param done {param.ds_tensor}", flush=True)
+
+            see_memory_usage(f'Before partitioning param {param.ds_id} {param.shape}', force=ENBALE_MEM_DEBUG)
+            # # zero35_debug(f"Before partitioning param ID {param.ds_id} partitioned type {param.dtype} dev {param.device} shape {param.shape}")
+            free_param(param)
+            # # zero35_debug(f"After partitioning param ID {param.ds_id} partitioned type {param.dtype} dev {param.device} shape {param.shape}")
+            see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}', force=ENBALE_MEM_DEBUG)
+
     @instrument_w_nvtx
     def _partition_param(self, param, buffer=None, has_been_updated=False):
+        assert global_zero35_manager.enable_zero35 is False
         assert param.ds_status is not ZeroParamStatus.INFLIGHT, f" {param} Cannot partition a param in flight"
         global reuse_buffers
         print_rank_0(f"Param id {param.ds_id} status is {param.ds_status}", force=False)
@@ -1416,7 +1655,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             if param.ds_tensor is not None and not has_been_updated:  ##param already partitioned
 
-                #print_rank_0(f"Param  {param.ds_id} pri {param.ds_tensor.size()}  loc? {param.ds_tensor.final_location}", force=True)
+                #print_rank_0(f"Param  {param.ds_id} pri {param.ds_tensor.size()}  loc? {param.ds_tensor.final_location}", force=ENBALE_MEM_DEBUG)
                 #param.data = param.ds_tensor.data
 
                 see_memory_usage(f'Before partitioning param {param.ds_id} {param.shape}', force=False)
@@ -1520,7 +1759,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         assert param.ds_status is not ZeroParamStatus.INFLIGHT, f" {param} Cannot partition a param in flight"
         global reuse_buffers
         ##support for NVME secondary param offload
-        #print_rank_0(f"SEC Param id {param.ds_id} status is {param.ds_status}", force=True)
+        #print_rank_0(f"SEC Param id {param.ds_id} status is {param.ds_status}", force=ENBALE_MEM_DEBUG)
         if param.ds_status is ZeroParamStatus.AVAILABLE:
             if param.ds_secondary_tensor is not None and not has_been_updated:  ##param already partitioned
 
@@ -1584,8 +1823,18 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         partition_size = param.ds_tensor.ds_numel
 
-        tensor_size = partition_size * self.num_partitions
-        aligned_param_size = self._aligned_size(param)
+        if global_zero35_manager.enable_zero35:
+            num_partitions = self.zero35_num_partitions(partition_type="param")
+            aligned_param_size = self._zero35_aligned_size(param, partition_type="param")
+            get_partition_rank = self.get_partition_rank(partition_type="param")
+            partition_dp_group = global_zero35_manager.get_partition_dp_group(param, partition_type="param")
+        else:
+            num_partitions = self.num_partitions
+            aligned_param_size = self._aligned_size(param)
+            get_partition_rank = self.get_partition_rank()
+            partition_dp_group = self.get_partition_dp_group(param)
+
+        tensor_size = partition_size * num_partitions
         assert tensor_size == aligned_param_size, f'param id {param.ds_id} aligned size {aligned_param_size} does not match tensor size {tensor_size}'
 
         print_rank_0(
@@ -1614,19 +1863,19 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         if self.use_all_gather_into_tensor:
             handle = dist.all_gather_into_tensor(flat_tensor,
                                                  param.ds_tensor.to(get_accelerator().device_name()),
-                                                 group=self.get_partition_dp_group(param),
+                                                 group=partition_dp_group,
                                                  async_op=async_op)
         else:
             partitions = []
-            for i in range(self.num_partitions):
+            for i in range(num_partitions):
                 partitions.append(flat_tensor.narrow(0, partition_size * i, partition_size))
 
-                if i == dist.get_rank(group=self.get_partition_dp_group(param)):
+                if i == dist.get_rank(group=partition_dp_group):
                     partitions[i].data.copy_(param.ds_tensor.data, non_blocking=True)
 
             handle = dist.all_gather(partitions,
-                                     partitions[self.get_partition_rank()],
-                                     group=self.get_partition_dp_group(param),
+                                     partitions[get_partition_rank],
+                                     group=partition_dp_group,
                                      async_op=async_op)
 
         replicated_tensor = flat_tensor.narrow(0, 0, param.ds_numel).view(param.ds_shape)
@@ -1637,10 +1886,18 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         """ blocking call
         avoid explicit memory copy in _allgather_params
         """
+        # assert global_zero35_manager is None or global_zero35_manager.enable_zero35 is False
         if len(param_list) == 0:
             return
 
-        if self.num_partitions == 1:
+        if global_zero35_manager is not None and global_zero35_manager.enable_zero35:
+            num_partitions = global_zero35_manager.get_partition_count(partition_type="param")
+            all_gather_process_group = global_zero35_manager.get_dp_process_group(partition_type="param")
+        else:
+            num_partitions = self.num_partitions
+            all_gather_process_group = self.get_partition_dp_group(param_list[0])
+
+        if num_partitions == 1:
             handle = _no_gather_coalesced(param_list)
             handle.wait()
             return None
@@ -1657,19 +1914,20 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             if quantize:
                 quantize_scale_sizes.append(param.ds_tensor.ds_quant_scale.numel())
                 quantize_scale_tensors.append(param.ds_tensor.ds_quant_scale.to(get_accelerator().device_name()))
+
         # allocate memory for allgather params
         allgather_params = []
         if quantize:
             allgather_quantize_scale = []
         for psize in partition_sizes:
-            tensor_size = psize * self.num_partitions
+            tensor_size = psize * num_partitions
             flat_tensor = torch.empty(tensor_size, dtype=param_list[0].ds_tensor.dtype,
                                       device=self.local_device).view(-1)
             flat_tensor.requires_grad = False
             allgather_params.append(flat_tensor)
         if quantize:
             for psize in quantize_scale_sizes:
-                tensor_size = psize * self.num_partitions
+                tensor_size = psize * num_partitions
                 flat_tensor = torch.empty(tensor_size,
                                           dtype=param_list[0].ds_tensor.ds_quant_scale.dtype,
                                           device=self.local_device).view(-1)
@@ -1682,39 +1940,61 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         for param_idx, param in enumerate(param_list):
             input_tensor = local_tensors[param_idx].view(-1)
 
+            if global_zero35_manager is not None and global_zero35_manager.enable_zero35:
+                all_gather_process_group = global_zero35_manager.get_dp_process_group(partition_type="param")
+            else:
+                all_gather_process_group = self.get_partition_dp_group(param_list[0])
+
+            if ENBALE_COMM_DEBUG:
+                if dist.get_rank() == 0:
+                    output_tensor = allgather_params[param_idx]
+                    print(f"_allgather_params_coalesced, param_idx:{param_idx} \
+comm_group:{dist.get_world_size(all_gather_process_group)} \
+nums:{output_tensor.numel()}, \
+size: {output_tensor.numel() * output_tensor.element_size()/ (1024**2):.4f} MB", flush=True)
+
             if self.use_all_gather_into_tensor:
                 # try the _all_gather_base from Pytorch master
                 h = dist.all_gather_into_tensor(allgather_params[param_idx],
                                                 input_tensor,
-                                                group=self.get_partition_dp_group(param),
+                                                group=all_gather_process_group,
                                                 async_op=True)
                 if quantize:
                     quantize_handle = dist.all_gather_into_tensor(allgather_quantize_scale[param_idx],
                                                                   quantize_scale_tensors[param_idx],
-                                                                  group=self.get_partition_dp_group(param),
+                                                                  group=all_gather_process_group,
                                                                   async_op=True)
                     launch_quantize_handles.append(quantize_handle)
             else:
                 output_list = []
-                for i in range(self.num_partitions):
+                gather_size = 0
+                for i in range(num_partitions):
                     psize = partition_sizes[param_idx]
+                    gather_size += psize
                     partition = allgather_params[param_idx].narrow(0, i * psize, psize)
                     output_list.append(partition)
                     if not get_accelerator().on_accelerator(partition):
                         logger.warning(
                             f'param {param_idx}, partition {i} is not on CUDA, partition shape {partition.size()}')
 
+            if ENBALE_COMM_DEBUG:
+                if dist.get_rank() == 0:
+                    print(f"_allgather_params_coalesced, param_idx:{param_idx} \
+comm_group:{dist.get_world_size(all_gather_process_group)} \
+nums:{gather_size}, \
+size: {gather_size* input_tensor.element_size()/ (1024**2):.4f} MB", flush=True)
+
                 # back to old all_gather function
-                h = dist.all_gather(output_list, input_tensor, group=self.get_partition_dp_group(param), async_op=True)
+                h = dist.all_gather(output_list, input_tensor, group=all_gather_process_group, async_op=True)
                 if quantize:
                     output_scale_list = []
-                    for i in range(self.num_partitions):
+                    for i in range(num_partitions):
                         psize = quantize_scale_sizes[param_idx]
                         partition = allgather_quantize_scale[param_idx].narrow(0, i * psize, psize)
                         output_scale_list.append(partition)
                     quant_handle = dist.all_gather(output_scale_list,
                                                    quantize_scale_tensors[param_idx],
-                                                   group=self.get_partition_dp_group(param),
+                                                   group=all_gather_process_group,
                                                    async_op=True)
                     launch_quantize_handles.append(quant_handle)
             launch_handles.append(h)
@@ -1728,6 +2008,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         # assign to param.data (not copy)
         for i, param in enumerate(param_list):
             gathered_tensor = allgather_params[i]
+
             if quantize:
                 gathered_tensor = self.quantizer_module.dequantize(gathered_tensor, allgather_quantize_scale[i])
             param.data = gathered_tensor.narrow(0, 0, param.ds_numel).view(param.ds_shape).data
@@ -1743,16 +2024,26 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         partition_size = sum([param.ds_tensor.ds_numel for param in param_list])
 
-        tensor_size = partition_size * self.num_partitions
+        if global_zero35_manager.enable_zero35:
+            # print("Warning: zero35调用了_allgather_params函数", flush=True)
+            num_partitions = self.zero35_num_partitions(partition_type="param")
+            partition_rank = self.get_partition_rank(partition_type="param")
+            partition_dp_group = global_zero35_manager.get_partition_dp_group(param_list[0], partition_type="param")
+        else:
+            num_partitions = self.num_partitions
+            partition_rank = self.get_partition_rank()
+            partition_dp_group = self.get_partition_dp_group(param_list[0])
+
+        tensor_size = partition_size * num_partitions
         flat_tensor = torch.empty(tensor_size, dtype=param_list[0].ds_tensor.dtype, device=self.local_device)
         flat_tensor.requires_grad = False
         partitions = []
-        for i in range(self.num_partitions):
+        for i in range(num_partitions):
             start = partition_size * i
 
             partitions.append(flat_tensor.narrow(0, start, partition_size))
 
-            if i == self.get_partition_rank():
+            if i == partition_rank:
                 offset = 0
                 for param in param_list:
                     param_numel = param.ds_tensor.ds_numel
@@ -1782,14 +2073,18 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
                         offset += param_scale_numel
 
+        if ENBALE_COMM_DEBUG:
+            if dist.get_rank() == 0:
+                print(f"_allgather_params, comm_group:{dist.get_world_size(partition_dp_group)} nums:{flat_tensor.numel()}, size: {flat_tensor.numel()*flat_tensor.element_size()/ (1024**2):.4f} MB", flush=True)
+
         dist.all_gather(partitions,
-                        partitions[self.get_partition_rank()],
-                        group=self.get_partition_dp_group(param),
+                        partitions[partition_rank],
+                        group=partition_dp_group,
                         async_op=False)
         if hasattr(param_list[0], 'ds_quant_scale'):
             dist.all_gather(flat_scale_tensor,
                             param_list[0].ds_quant_scale,
-                            group=self.get_partition_dp_group(param),
+                            group=partition_dp_group,
                             async_op=False)
         param_offset = 0
 
@@ -1798,7 +2093,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             param_size = param.ds_numel
             replicated_tensor = torch.empty(param.ds_shape, dtype=param.ds_tensor.dtype, device=self.local_device)
 
-            for i in range(self.num_partitions):
+            for i in range(num_partitions):
 
                 start = i * partition_size
 
@@ -1819,6 +2114,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         return None
 
     def _reduce_scatter_gradients(self, param_list):
+        assert global_zero35_manager.enable_zero35 is False
         #print_rank_0([param.grad for param in param_list])
         #assert any([param.grad is None for param in param_list]), "None gradients cannot be reduce scattered"
 
@@ -1846,13 +2142,16 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
     def _reduce_scatter_gradient(self, param):
 
+        assert global_zero35_manager.enable_zero35 is False
+
         partition_size = param.ds_tensor.ds_numel
         #output = torch.empty(partition_size, dtype=param.dtype, device=param.device)
+        num_partitions = self.num_partitions
 
-        total_size = partition_size * self.num_partitions
+        total_size = partition_size * num_partitions
         input_list = []
 
-        for i in range(self.num_partitions):
+        for i in range(num_partitions):
 
             start = i * partition_size
             end = start + partition_size
@@ -1902,7 +2201,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             assert partition_buffer.numel(
             ) >= partition_size, f"The partition buffer size {partition_buffer.numel()} should match the size of param.ds_tensor {partition_size}"
 
-        rank = dist.get_rank(group=self.get_partition_dp_group(param))
+        if global_zero35_manager.enable_zero35:
+            partition_dp_group = global_zero35_manager.get_partition_dp_group(param, partition_type="grad")
+        else:
+            partition_dp_group = self.get_partition_dp_group(param)
+
+        rank = dist.get_rank(group=partition_dp_group)
         start = partition_size * rank
         end = start + partition_size
 
@@ -1949,14 +2253,24 @@ class Init(InsertPostInitMethodToModuleSubClasses):
     def get_partition_dp_group(self, param):
         return param.ds_process_group
 
-    def get_partition_rank(self):
+    def get_partition_rank(self, partition_type=None):
         """subclass can overload to specify different relative rank in
         parameter partition group"""
-        return self.rank
+        if partition_type is None:
+            assert global_zero35_manager is None or global_zero35_manager.enable_zero35 is False
+            return self.rank
+        else:
+            return global_zero35_manager.get_rank_in_group(partition_type=partition_type)
 
     @property
     def num_partitions(self):
         return self.dp_world_size
+    
+    def zero35_num_partitions(self, partition_type=None):
+        if partition_type is None:
+            return self.dp_world_size
+        else:
+            return global_zero35_manager.num_partitions(partition_type)
 
     def get_dp_process_group(self):
         """ Return the communication group with all data-parallel ranks """

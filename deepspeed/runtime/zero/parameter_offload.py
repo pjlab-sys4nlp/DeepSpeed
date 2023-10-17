@@ -217,6 +217,7 @@ class DeepSpeedZeRoOffload(object):
         zero_param_parallel_group=None,
         zero_quantized_weights=False,
         zero_quantized_nontrainable_weights=False,
+        enable_zero35=False,
     ):
 
         see_memory_usage("DeepSpeedZeRoOffload initialize [begin]", force=True)
@@ -232,6 +233,7 @@ class DeepSpeedZeRoOffload(object):
         self.zero_param_parallel_group = zero_param_parallel_group
         self.zero_quantized_weights = zero_quantized_weights
         self.zero_quantized_nontrainable_weights = zero_quantized_nontrainable_weights
+        self.enable_zero35 = enable_zero35
 
         if offload_param_config is not None and offload_param_config.device != OffloadDeviceEnum.none:
             self.offload_device = offload_param_config.device
@@ -294,6 +296,7 @@ class DeepSpeedZeRoOffload(object):
                 timers=self.timers,
                 zero_quantized_weights=self.zero_quantized_weights,
                 zero_quantized_nontrainable_weights=self.zero_quantized_nontrainable_weights,
+                enable_zero35=self.enable_zero35,
             )
 
         return self.param_coordinators[training]
@@ -321,7 +324,7 @@ class DeepSpeedZeRoOffload(object):
                      mpu=mpu,
                      zero_param_parallel_group=self.zero_param_parallel_group,
                      zero_quantized_weights=self.zero_quantized_weights,
-                     zero_quantized_nontrainable_weights=self.zero_quantized_nontrainable_weights)
+                     zero_quantized_nontrainable_weights=self.zero_quantized_nontrainable_weights,)
 
     def destroy(self):
         self._remove_module_hooks()

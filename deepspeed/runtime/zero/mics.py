@@ -28,7 +28,7 @@ def has_hierarchical_all_gather_groups(comm_groups: MiCS_CommGroups):
         result = True
     return result
 
-
+from deepspeed.runtime.zero.zero35_utils import get_global_zero35_manager
 class MiCS_AllGatherCoalescedHandle(AllGatherCoalescedHandle):
     """ This handle assumes that no need to
     copy data out from a contiguous tensor
@@ -46,6 +46,10 @@ class MiCS_AllGatherCoalescedHandle(AllGatherCoalescedHandle):
             return
 
         for _, param in enumerate(self.params):
+
+            assert get_global_zero35_manager().enable_zero35 is True
+            get_global_zero35_manager().zero35_restore_allgahter_ds_tensor(param)
+            # zero35_debug(f"finish allgather param.data:{param.data.numel()}, ds_tensor.numel:{param.ds_tensor.numel()}", force=True)
             assert param.ds_status == ZeroParamStatus.INFLIGHT, f"expected param {param.ds_summary()} to be inflight"
             param.ds_status = ZeroParamStatus.AVAILABLE
 
@@ -300,7 +304,7 @@ class MiCS_Init(Init):
         return self.mics_comm_groups.param_shard_rank
 
     @property
-    def num_partitions(self):
+    def num_partitions(self, parition_type=None):
         return self.mics_comm_groups.param_shard_size
 
 
