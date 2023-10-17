@@ -2011,7 +2011,7 @@ size: {numels* full_grads_for_rank[0].element_size()/ (1024**2):.4f} MB", flush=
                 partitioned_param.data = q.data
         else:
             def get_sub_p_g_parition_from_torch_tensor(torch_tensor, i):
-                zero35_rank = dist.get_rank() // 8  # TODO, remove hard code
+                zero35_rank = dist.get_rank() // global_zero35_manager.zero35_parallel_size  # TODO, remove hard code
                 # zero35_debug(f"self._param_partition_unit_size[sub_group_id]: {self._param_partition_unit_size[sub_group_id]}", flush=ENBALE_MEM_DEBUG)
                 return torch_tensor.reshape(-1, self._param_partition_unit_size[sub_group_id][i])[zero35_rank]
 

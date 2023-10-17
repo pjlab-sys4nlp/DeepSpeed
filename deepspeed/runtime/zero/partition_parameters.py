@@ -1548,7 +1548,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         param_num_partitions = dist.get_world_size(param_comm_group)
         dp_num_partitions = dist.get_world_size(dp_comm_group)
 
-        assert param_num_partitions == 8, "zero35 split param in local node device"
+        # assert param_num_partitions == 8, "zero35 split param in local node device"
+        # if param_num_partitions != 8:
+        #     print(f"zero35 split param worldisze: {param_num_partitions}", flush=True)
 
         if param.ds_status is ZeroParamStatus.AVAILABLE:
             print_rank_0(f"Partitioning param id {param.ds_id} reuse buffers {reuse_buffers}", force=False)

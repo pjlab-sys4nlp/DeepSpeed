@@ -206,7 +206,11 @@ class GlobalZero35GroupManager:
 
         assert self.model_parallel_size == 1, "zero35现在不支持模型并行"
 
-        self.zero35_parallel_size = 8 # TODO: 将这个变成可配置参数
+        if 'zero35_parallel_size' not in os.environ:
+            self.zero35_parallel_size = 8
+        else:
+            self.zero35_parallel_size = int(os.environ['zero35_parallel_size']) # TODO: 将这个变成可配置参数
+
         self.rank_num_per_dp_group = self.world_size // self.data_parallel_size
         self.num_zero35_parallel_group = self.data_parallel_size // self.zero35_parallel_size
 
