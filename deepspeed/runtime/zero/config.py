@@ -293,6 +293,13 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     Override nn.Module apply function, for Stage 3.
     """
 
+    enable_lins: bool = False
+    lins_param_partition_num: int = Field(-1, new_param="lins_param_partition_num")
+    lins_os_partition_num: int = Field(-1, new_param="lins_os_partition_num")
+    lins_grad_partition_num: int = Field(-1, new_param="lins_grad_partition_num")
+    hierarchical_allgather: bool = False
+
+
     # Validators
     @validator("overlap_comm")
     def overlap_comm_valid(cls, field_value, values):

@@ -26,6 +26,7 @@ from deepspeed.runtime.swap_tensor.partitioned_optimizer_swapper import Partitio
 from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedOptimizerSwapper
 from deepspeed.checkpoint.constants import OPTIMIZER_STATE_DICT, FP32_FLAT_GROUPS, PARTITION_COUNT, ZERO_STAGE
 from deepspeed.accelerator import get_accelerator
+from deepspeed.runtime.zero.lins_utils import zero35_debug, set_lins_parition_type
 
 # Toggle this to true to enable correctness test
 # with gradient partitioning and without
@@ -188,6 +189,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             zero_quantized_weights=zero_quantized_weights,
             zero_quantized_nontrainable_weights=zero_quantized_nontrainable_weights)
 
+        self._get_param_coordinator(training=True).gradient_accumulation_steps = gradient_accumulation_steps
         self.persistent_parameters = self.parameter_offload.persistent_parameters
         self._configure_offloading(offload_optimizer_config, offload_param_config)
 
@@ -339,7 +341,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         print_rank_0(f'Largest partitioned param numel = {largest_partitioned_param_numel}', force=False)
 
-        self._setup_for_real_optimizer()
+        all_params = self._setup_for_real_optimizer()
         self.grad_position = {}
         self.set_grad_positions()
 
@@ -374,6 +376,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         if dist.get_rank(group=self.dp_process_group) == 0:
             see_memory_usage(f"After initializing ZeRO optimizer", force=True)
+
+        if all_params is not None:
+            self.cal_stage3_mem_usage(all_params)
+
 
     def destroy(self):
         self.parameter_offload.destroy()
@@ -631,13 +637,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
                 self.param_groups_fp16_flat_cpu_memory.append(torch.empty(1, dtype=self.dtype))
 
-    def _create_fp16_partitions_with_defragmentation(self, fp16_param_groups):
-        dist.barrier()
-
-        param_groups: List[List[Parameter]] = tuple(
-            self._create_fp16_sub_groups(param_group["params"]) for param_group in fp16_param_groups)
-
-        # bookkeeping related to param groups
+    def bookkeeping_param_group(self, param_groups):
         for param_group_idx, param_group in enumerate(param_groups):
             for sub_group in param_group:
                 sub_group_idx = len(self.fp16_groups)
@@ -657,6 +657,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     self.dp_process_group) == dist.get_world_size(self.dp_process_group) - 1
                 self.groups_padding.append([p.padding_size() if rank_requires_padding else 0 for p in sub_group])
 
+    def _create_fp16_partitions_with_defragmentation(self, fp16_param_groups):
+        dist.barrier()
+
+        param_groups: List[List[Parameter]] = tuple(
+            self._create_fp16_sub_groups(param_group["params"]) for param_group in fp16_param_groups)
+
+        # bookkeeping related to param groups
+        self.bookkeeping_param_group(param_groups)
+
         # move parameters to flattened buffer
         if not self.offload_param:  # partitioned params remain in GPU during training
             # move parameter partitions into a single contiguous flat buffer
@@ -670,8 +679,16 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             # contiguous flat buffer for all parameters that we created earlier
             offset = 0
             for sub_group in self.fp16_groups:
-                sub_group_numel = sum(param.partition_numel() for param in sub_group)
-                self.fp16_partitioned_groups_flat.append(device_buffer.narrow(0, offset, sub_group_numel))
+                with set_lins_parition_type(partition_type="os"):
+                    sub_group_numel = sum(param.partition_numel() for param in sub_group)
+                # import pdb
+                # pdb.set_trace()
+                try:
+                    self.fp16_partitioned_groups_flat.append(device_buffer.narrow(0, offset, sub_group_numel))
+                except Exception as e:
+                    print("catch: {e}", flush=True)
+                    import pdb
+                    pdb.set_trace()
                 offset += sub_group_numel
         else:  # partitioned params offloaded to CPU when not in use
             # create a flat CPU memory allocation for each param group
@@ -854,7 +871,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
     def _create_fp16_sub_groups(self, params_group):
 
-        params_group_numel = sum([param.partition_numel() for param in params_group])
+        params_group_numel = sum([param.partition_numel(partition_type="os") for param in params_group])
         sub_group_size = self.sub_group_size
 
         if sub_group_size is None or sub_group_size >= params_group_numel:
@@ -866,7 +883,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         for param in params_group:
 
             sub_group.append(param)
-            local_sub_group_size += param.partition_numel()
+            local_sub_group_size += param.partition_numel(partition_type="os")
 
             if local_sub_group_size >= sub_group_size or id(param) == id(params_group[-1]):
 
@@ -1241,7 +1258,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             current_offset = 0
             for param in group:
                 param_id = self.get_param_id(param)
-                num_elements = param.partition_numel()
+                with set_lins_parition_type(partition_type="param"):
+                    num_elements = param.partition_numel()
 
                 self.grad_position[param_id] = [int(i), int(current_offset), int(num_elements)]
                 #print(f"param id {param_id} i:{i}, ds_tensor {num_elements} numel {param.numel()}")
@@ -1574,6 +1592,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         Zero FP16 parameter grads.
         """
         self.micro_step_id = 0
+        self._get_param_coordinator(training=True).micro_step_id = 0
 
         # FP32 grad should never exist.
         # For speed, set model fp16 grad to None by default
@@ -1703,6 +1722,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
     def _pre_step(self):
         self.micro_step_id = 0
+        self._get_param_coordinator(training=True).micro_step_id = 0
 
         print_rank_0(f"Inside Step function")
         see_memory_usage(f"In step before checking overflow", force=False)
