@@ -1028,6 +1028,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         # The group that the parameter is scattered across.
         param.ds_process_group = self.ds_process_group
 
+        def get_param_process_group():
+            return param.ds_process_group
+
+        param.get_param_process_group = get_param_process_group
+
         # Stores the secondary partitioned copy of the tensor
         param.ds_secondary_tensor = None
 

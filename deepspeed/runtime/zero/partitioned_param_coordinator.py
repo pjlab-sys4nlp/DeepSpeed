@@ -18,6 +18,9 @@ from deepspeed.utils.debug import debug_module2name_id, debug_param2name_id
 from deepspeed.accelerator import get_accelerator
 import logging
 
+from deepspeed.runtime.zero.lins_utils import zero35_debug, set_lins_parition_type
+
+
 ENABLE_PROFILER = False
 
 
@@ -124,6 +127,12 @@ class PartitionedParameterCoordinator:
         # TODO. make this configurable via JSON
         self.__max_ongoing_fetch_events: int = 2
         self.__profiler = PartitionedParameterProfiler(timers if ENABLE_PROFILER else None)
+
+        # （TODO):wgt
+        self.is_gradient_accumulation_boundary = True
+        self.micro_step_id = 0
+        self.gradient_accumulation_steps = None
+        self.all_gahter_count = 0
 
     """Tracing and Tracking
     TODO. consider performing trace before initializing PartitionedParameterCoordinator
@@ -269,8 +278,10 @@ class PartitionedParameterCoordinator:
                 }))
 
         params_to_fetch = frozenset(iter_params(current_submodule))
-        fetch_numel = sum(
-            [p.partition_numel() for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
+
+        with set_lins_parition_type(partition_type = "param"):
+            fetch_numel = sum(
+                [p.partition_numel() for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
         if fetch_numel > 0:
             event_name = __class__.FORWARD_FETCH_SUBMIT if forward else __class__.BACKWARD_FETCH_SUBMIT
             self._dump_param_ids(event_name, current_submodule.id,
@@ -293,7 +304,8 @@ class PartitionedParameterCoordinator:
             if logger.isEnabledFor(logging.DEBUG):
                 debug_rank0(f"-wait: {param.ds_summary()}")
             if param in self.__inflight_param_registry:
-                wait_numel += param.partition_numel()
+                with set_lins_parition_type(partition_type = "param"):
+                    wait_numel += param.partition_numel()
                 with get_accelerator().stream(self.__allgather_stream):
                     while self.__ongoing_fetch_events and self.__ongoing_fetch_events[0].query():
                         self.__ongoing_fetch_events.popleft()
